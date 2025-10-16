@@ -70,6 +70,11 @@ class ModelSerializer:
             # Create model directory if it doesn't exist
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
+            # CRITICAL: Mark model as trained before saving
+            adaptive_model.model_trained = True
+            adaptive_model.model.is_trained = True
+            adaptive_model.model.core.is_trained = True
+
             # Validate data before saving
             validation_msg = ModelSerializer._validate_model_before_save(adaptive_model)
             if validation_msg:
@@ -86,6 +91,27 @@ class ModelSerializer:
             else:
                 print("⚠️ No label encoder state to save")
 
+            # CRITICAL FIX: Comprehensive feature name capture from multiple sources
+            feature_names = []
+
+            # Try wrapper feature_names first
+            if hasattr(adaptive_model.model, 'feature_names') and adaptive_model.model.feature_names:
+                feature_names = adaptive_model.model.feature_names
+                print(f"💾 Found feature names in wrapper: {len(feature_names)} features")
+
+            # Try preprocessor feature_columns next
+            if not feature_names and hasattr(adaptive_model.model.preprocessor, 'feature_columns'):
+                feature_names = adaptive_model.model.preprocessor.feature_columns
+                print(f"💾 Found feature names in preprocessor: {len(feature_names)} features")
+
+            # Final fallback: infer from X_full shape
+            if not feature_names and hasattr(adaptive_model, 'X_full') and adaptive_model.X_full is not None:
+                n_features = adaptive_model.X_full.shape[1]
+                feature_names = [f'feature_{i}' for i in range(n_features)]
+                print(f"💾 Inferred feature names from data shape: {len(feature_names)} features")
+
+            print(f"💾 Final feature names to save: {feature_names}")
+
             # Collect all model state information
             model_state = {
                 'metadata': {
@@ -94,6 +120,7 @@ class ModelSerializer:
                     'version': '1.0',
                     'model_type': 'AdaptiveCTDBNN',
                     'has_label_encoder': has_label_encoder,
+                    'n_features': len(feature_names),
                 },
                 'config': adaptive_model.config,
                 'adaptive_config': adaptive_model.adaptive_config,
@@ -110,7 +137,7 @@ class ModelSerializer:
                     'X_full': getattr(adaptive_model, 'X_full', None),
                     'y_full': getattr(adaptive_model, 'y_full', None),
                     'y_full_original': getattr(adaptive_model, 'y_full_original', None),
-                    'feature_names': getattr(adaptive_model.model, 'feature_names', []),
+                    'feature_names': feature_names,  # CRITICAL: Save feature names
                     'target_column': getattr(adaptive_model.model, 'target_column', 'target'),
                     'class_to_label': getattr(adaptive_model, 'class_to_label', {}),
                     'label_to_class': getattr(adaptive_model, 'label_to_class', {}),
@@ -120,13 +147,14 @@ class ModelSerializer:
                     'target_encoder': adaptive_model.model.preprocessor.target_encoder,
                     'scaler': adaptive_model.model.preprocessor.scaler,
                     'missing_value_indicators': adaptive_model.model.preprocessor.missing_value_indicators,
-                    'feature_columns': getattr(adaptive_model.model.preprocessor, 'feature_columns', []),
+                    'feature_columns': feature_names,  # Also save in preprocessor state
                 },
                 'ctdbnn_core_state': ModelSerializer._extract_ctdbnn_state(adaptive_model.model.core),
                 'wrapper_state': {
                     'initialized_with_full_data': getattr(adaptive_model.model, 'initialized_with_full_data', False),
                     'architecture_frozen': getattr(adaptive_model.model, 'architecture_frozen', False),
                     'frozen_components': getattr(adaptive_model.model, 'frozen_components', {}),
+                    'feature_names': feature_names,  # And in wrapper state for redundancy
                 }
             }
 
@@ -152,9 +180,13 @@ class ModelSerializer:
                 if len(adaptive_model.X_full) != len(adaptive_model.y_full):
                     warnings.append("X and y have different lengths")
 
-                if (hasattr(adaptive_model.model, 'feature_names') and
-                    adaptive_model.X_full.shape[1] != len(adaptive_model.model.feature_names)):
-                    warnings.append("Feature count doesn't match feature names")
+                # Get feature names from multiple possible locations
+                feature_names = getattr(adaptive_model.model, 'feature_names', [])
+                if not feature_names and hasattr(adaptive_model.model, 'preprocessor'):
+                    feature_names = getattr(adaptive_model.model.preprocessor, 'feature_columns', [])
+
+                if feature_names and adaptive_model.X_full.shape[1] != len(feature_names):
+                    warnings.append(f"Feature count mismatch: X has {adaptive_model.X_full.shape[1]}, feature_names has {len(feature_names)}")
 
             # Check if model is trained
             if not getattr(adaptive_model, 'model_trained', False):
@@ -165,44 +197,6 @@ class ModelSerializer:
 
         return "; ".join(warnings) if warnings else ""
 
-
-    @staticmethod
-    def _extract_ctdbnn_state(core_model):
-        """Extract all relevant state from CT-DBNN core"""
-        state = {}
-        try:
-            # Get all attributes that are important for the model
-            important_attrs = [
-                'global_anti_net', 'global_likelihoods', 'likelihoods_computed',
-                'orthogonal_weights', 'is_trained', 'resol', 'innodes', 'outnodes',
-                'feature_bins', 'feature_min', 'feature_max', 'n_bins',
-                'class_labels', 'unique_classes', 'posterior_cache',
-                'global_likelihood_computed', 'orthogonal_weights_initialized'
-            ]
-
-            for attr in important_attrs:
-                if hasattr(core_model, attr):
-                    value = getattr(core_model, attr)
-                    # Handle numpy arrays and tensors
-                    if hasattr(value, 'dtype'):
-                        state[attr] = value
-                    else:
-                        state[attr] = value
-
-            # Add tensor-specific attributes
-            tensor_attrs = ['complex_tensor', 'real_tensor', 'weight_tensor']
-            for attr in tensor_attrs:
-                if hasattr(core_model, attr):
-                    tensor_value = getattr(core_model, attr)
-                    if tensor_value is not None:
-                        state[attr] = tensor_value
-
-            print(f"✅ Extracted CT-DBNN state with {len(state)} attributes")
-
-        except Exception as e:
-            print(f"❌ Could not extract CT-DBNN state: {e}")
-
-        return state
 
     @staticmethod
     def load_model(file_path, adaptive_model=None):
@@ -231,7 +225,7 @@ class ModelSerializer:
             adaptive_model.config.update(model_state['config'])
             adaptive_model.adaptive_config.update(model_state['adaptive_config'])
 
-            # Restore training state - CRITICAL for starting from previous best
+            # Restore training state
             training_state = model_state['training_state']
             adaptive_model.best_accuracy = training_state['best_accuracy']
             adaptive_model.best_training_indices = training_state['best_training_indices']
@@ -249,14 +243,36 @@ class ModelSerializer:
             adaptive_model.y_full = data_state['y_full']
             adaptive_model.y_full_original = data_state['y_full_original']
 
-            # Ensure feature names and target column are properly set
-            adaptive_model.model.feature_names = data_state.get('feature_names', [])
+            # CRITICAL FIX: Comprehensive feature name restoration
+            feature_names = []
+
+            # Try multiple sources for feature names
+            if 'feature_names' in data_state and data_state['feature_names']:
+                feature_names = data_state['feature_names']
+                print(f"💾 Restored feature names from data_state: {len(feature_names)} features")
+            elif 'feature_columns' in model_state['preprocessor_state'] and model_state['preprocessor_state']['feature_columns']:
+                feature_names = model_state['preprocessor_state']['feature_columns']
+                print(f"💾 Restored feature names from preprocessor_state: {len(feature_names)} features")
+            elif 'feature_names' in model_state['wrapper_state'] and model_state['wrapper_state']['feature_names']:
+                feature_names = model_state['wrapper_state']['feature_names']
+                print(f"💾 Restored feature names from wrapper_state: {len(feature_names)} features")
+            else:
+                # Final fallback: infer from X_full shape
+                if adaptive_model.X_full is not None:
+                    n_features = adaptive_model.X_full.shape[1]
+                    feature_names = [f'feature_{i}' for i in range(n_features)]
+                    print(f"💾 Inferred feature names from data shape: {len(feature_names)} features")
+
+            print(f"💾 Final restored feature names: {feature_names}")
+
+            # Ensure feature names and target column are properly set in ALL locations
+            adaptive_model.model.feature_names = feature_names
             adaptive_model.model.target_column = data_state.get('target_column', 'target')
             adaptive_model.target_column = data_state.get('target_column', 'target')
             adaptive_model.class_to_label = data_state.get('class_to_label', {})
             adaptive_model.label_to_class = data_state.get('label_to_class', {})
 
-            print(f"✅ Restored data: {len(adaptive_model.model.feature_names)} features, {len(adaptive_model.X_full) if adaptive_model.X_full is not None else 0} samples")
+            print(f"✅ Restored data: {len(feature_names)} features, {len(adaptive_model.X_full) if adaptive_model.X_full is not None else 0} samples")
 
             # Restore preprocessor state
             preprocessor_state = model_state['preprocessor_state']
@@ -264,18 +280,18 @@ class ModelSerializer:
             adaptive_model.model.preprocessor.target_encoder = preprocessor_state['target_encoder']
             adaptive_model.model.preprocessor.scaler = preprocessor_state['scaler']
             adaptive_model.model.preprocessor.missing_value_indicators = preprocessor_state['missing_value_indicators']
-            adaptive_model.model.preprocessor.feature_columns = preprocessor_state.get('feature_columns', [])
+            adaptive_model.model.preprocessor.feature_columns = feature_names  # CRITICAL: Set feature columns
 
             # Check label encoder restoration
             target_encoder = adaptive_model.model.preprocessor.target_encoder
             if (hasattr(target_encoder, 'classes_') and
                 target_encoder.classes_ is not None and
                 len(target_encoder.classes_) > 0):
-                print(f"✅ Label encoder restored with {len(target_encoder.classes_)} classes")
+                print(f"✅ Label encoder restored with {len(target_encoder.classes_)} classes: {list(target_encoder.classes_)}")
             else:
                 print("⚠️ Label encoder not properly restored")
 
-            # Restore CT-DBNN core state - CRITICAL for model performance
+            # Restore CT-DBNN core state
             core_restored = ModelSerializer._restore_ctdbnn_state(adaptive_model.model.core, model_state['ctdbnn_core_state'])
             if core_restored:
                 print("✅ CT-DBNN core state restored")
@@ -288,7 +304,7 @@ class ModelSerializer:
             adaptive_model.model.architecture_frozen = wrapper_state['architecture_frozen']
             adaptive_model.model.frozen_components = wrapper_state['frozen_components']
 
-            # Mark model as trained
+            # CRITICAL: Mark model as trained after restoration
             adaptive_model.model_trained = True
             adaptive_model.model.is_trained = True
             adaptive_model.model.core.is_trained = True
@@ -339,6 +355,45 @@ class ModelSerializer:
             warnings.append(f"Validation error: {e}")
 
         return "; ".join(warnings) if warnings else ""
+
+
+    @staticmethod
+    def _extract_ctdbnn_state(core_model):
+        """Extract all relevant state from CT-DBNN core"""
+        state = {}
+        try:
+            # Get all attributes that are important for the model
+            important_attrs = [
+                'global_anti_net', 'global_likelihoods', 'likelihoods_computed',
+                'orthogonal_weights', 'is_trained', 'resol', 'innodes', 'outnodes',
+                'feature_bins', 'feature_min', 'feature_max', 'n_bins',
+                'class_labels', 'unique_classes', 'posterior_cache',
+                'global_likelihood_computed', 'orthogonal_weights_initialized'
+            ]
+
+            for attr in important_attrs:
+                if hasattr(core_model, attr):
+                    value = getattr(core_model, attr)
+                    # Handle numpy arrays and tensors
+                    if hasattr(value, 'dtype'):
+                        state[attr] = value
+                    else:
+                        state[attr] = value
+
+            # Add tensor-specific attributes
+            tensor_attrs = ['complex_tensor', 'real_tensor', 'weight_tensor']
+            for attr in tensor_attrs:
+                if hasattr(core_model, attr):
+                    tensor_value = getattr(core_model, attr)
+                    if tensor_value is not None:
+                        state[attr] = tensor_value
+
+            print(f"✅ Extracted CT-DBNN state with {len(state)} attributes")
+
+        except Exception as e:
+            print(f"❌ Could not extract CT-DBNN state: {e}")
+
+        return state
 
     @staticmethod
     def _restore_ctdbnn_state(core_model, state_dict):
@@ -878,6 +933,9 @@ class DataPreprocessor:
             processed_features.append(numeric_data)
             feature_names.append(col)
 
+        # CRITICAL: Store feature columns for serialization
+        self.feature_columns = feature_names.copy()
+
         # Stack all features
         if processed_features:
             X_processed = np.column_stack(processed_features)
@@ -982,6 +1040,7 @@ class DataPreprocessor:
 
         print(f"✅ Preprocessing complete: {X_processed.shape[0]} samples, {X_processed.shape[1]} features")
         print(f"📊 Feature types: {len(feature_names)} numeric/categorical features")
+        print(f"💾 Stored feature names: {feature_names}")
 
         return X_processed, y_processed, feature_names
 
@@ -1050,7 +1109,7 @@ class OptimizedCTDBNNWrapper:
         self.test_size = self.config.get('test_size', 0.2)
         self.random_state = self.config.get('random_state', 42)
 
-        # Feature information
+        # Feature information - CRITICAL: Initialize feature_names properly
         self.feature_names = []
         self.initialized_with_full_data = False
 
@@ -1186,7 +1245,16 @@ class OptimizedCTDBNNWrapper:
         if self.data is None:
             raise ValueError("No data loaded. Call load_data() first.")
 
-        return self.preprocessor.preprocess_dataset(self.data)
+        X_processed, y_processed, feature_names = self.preprocessor.preprocess_dataset(self.data)
+
+        # CRITICAL: Store feature names in multiple locations for serialization
+        self.feature_names = feature_names
+        self.preprocessor.feature_columns = feature_names
+
+        print(f"💾 Wrapper stored feature names: {len(self.feature_names)} features - {self.feature_names}")
+
+        return X_processed, y_processed, feature_names
+
 
     def initialize_with_full_data(self, X: np.ndarray, y: np.ndarray):
         """Step 1: Initialize CT-DBNN architecture with full dataset - NO TRAINING"""
@@ -1198,16 +1266,20 @@ class OptimizedCTDBNNWrapper:
 
         # Create temporary file with full data
         temp_file = f"temp_full_init_{int(time.time())}.csv"
-        feature_cols = [f'feature_{i}' for i in range(X.shape[1])]
+
+        # CRITICAL: Use actual feature names if available, otherwise create generic ones
+        if hasattr(self, 'feature_names') and self.feature_names:
+            feature_cols = self.feature_names
+        else:
+            feature_cols = [f'feature_{i}' for i in range(X.shape[1])]
+            self.feature_names = feature_cols  # Store for serialization
+
         full_df = pd.DataFrame(X, columns=feature_cols)
         full_df[self.target_column] = y
         full_df.to_csv(temp_file, index=False)
 
         try:
             # For CT-DBNN, architecture initialization means computing global likelihoods
-            feature_cols = [f'feature_{i}' for i in range(len(feature_cols))]
-
-            # Compute global likelihoods (CT-DBNN's architecture setup)
             print("🔄 Computing global likelihoods with memory optimization...")
 
             # Load data for initialization
@@ -1215,6 +1287,7 @@ class OptimizedCTDBNNWrapper:
             y_temp = X_temp[self.target_column].values
             X_temp = X_temp.drop(columns=[self.target_column]).values
 
+            # CRITICAL: Pass the actual feature names
             self.core.compute_global_likelihoods(X_temp, y_temp, feature_cols)
 
             # Store feature information for serialization
