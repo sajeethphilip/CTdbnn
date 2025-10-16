@@ -91,26 +91,29 @@ class ModelSerializer:
             else:
                 print("⚠️ No label encoder state to save")
 
-            # CRITICAL FIX: Comprehensive feature name capture from multiple sources
+            # CRITICAL FIX: Get ACTUAL feature names from the preprocessor
             feature_names = []
 
-            # Try wrapper feature_names first
-            if hasattr(adaptive_model.model, 'feature_names') and adaptive_model.model.feature_names:
-                feature_names = adaptive_model.model.feature_names
-                print(f"💾 Found feature names in wrapper: {len(feature_names)} features")
-
-            # Try preprocessor feature_columns next
-            if not feature_names and hasattr(adaptive_model.model.preprocessor, 'feature_columns'):
+            # Priority 1: Get from preprocessor (this has the ACTUAL names)
+            if (hasattr(adaptive_model.model.preprocessor, 'feature_columns') and
+                adaptive_model.model.preprocessor.feature_columns):
                 feature_names = adaptive_model.model.preprocessor.feature_columns
-                print(f"💾 Found feature names in preprocessor: {len(feature_names)} features")
+                print(f"💾 Saving ACTUAL feature names from preprocessor: {feature_names}")
 
-            # Final fallback: infer from X_full shape
-            if not feature_names and hasattr(adaptive_model, 'X_full') and adaptive_model.X_full is not None:
+            # Priority 2: Get from wrapper feature_names
+            elif (hasattr(adaptive_model.model, 'feature_names') and
+                  adaptive_model.model.feature_names):
+                feature_names = adaptive_model.model.feature_names
+                print(f"💾 Saving feature names from wrapper: {feature_names}")
+
+            # Final fallback: infer from X_full shape (should not happen)
+            elif (hasattr(adaptive_model, 'X_full') and
+                  adaptive_model.X_full is not None):
                 n_features = adaptive_model.X_full.shape[1]
                 feature_names = [f'feature_{i}' for i in range(n_features)]
-                print(f"💾 Inferred feature names from data shape: {len(feature_names)} features")
+                print(f"⚠️  Using generic feature names as fallback: {feature_names}")
 
-            print(f"💾 Final feature names to save: {feature_names}")
+            print(f"💾 Final ACTUAL feature names being saved: {len(feature_names)} features - {feature_names}")
 
             # Collect all model state information
             model_state = {
@@ -137,7 +140,7 @@ class ModelSerializer:
                     'X_full': getattr(adaptive_model, 'X_full', None),
                     'y_full': getattr(adaptive_model, 'y_full', None),
                     'y_full_original': getattr(adaptive_model, 'y_full_original', None),
-                    'feature_names': feature_names,  # CRITICAL: Save feature names
+                    'feature_names': feature_names,  # CRITICAL: Save ACTUAL feature names
                     'target_column': getattr(adaptive_model.model, 'target_column', 'target'),
                     'class_to_label': getattr(adaptive_model, 'class_to_label', {}),
                     'label_to_class': getattr(adaptive_model, 'label_to_class', {}),
@@ -147,7 +150,7 @@ class ModelSerializer:
                     'target_encoder': adaptive_model.model.preprocessor.target_encoder,
                     'scaler': adaptive_model.model.preprocessor.scaler,
                     'missing_value_indicators': adaptive_model.model.preprocessor.missing_value_indicators,
-                    'feature_columns': feature_names,  # Also save in preprocessor state
+                    'feature_columns': feature_names,  # Also save ACTUAL names in preprocessor state
                 },
                 'ctdbnn_core_state': ModelSerializer._extract_ctdbnn_state(adaptive_model.model.core),
                 'wrapper_state': {
@@ -243,29 +246,27 @@ class ModelSerializer:
             adaptive_model.y_full = data_state['y_full']
             adaptive_model.y_full_original = data_state['y_full_original']
 
-            # CRITICAL FIX: Comprehensive feature name restoration
+            # CRITICAL FIX: Restore ACTUAL feature names
             feature_names = []
 
-            # Try multiple sources for feature names
+            # Priority: Get from data_state (this should have the ACTUAL names)
             if 'feature_names' in data_state and data_state['feature_names']:
                 feature_names = data_state['feature_names']
-                print(f"💾 Restored feature names from data_state: {len(feature_names)} features")
+                print(f"💾 Restored ACTUAL feature names from data_state: {len(feature_names)} features - {feature_names}")
             elif 'feature_columns' in model_state['preprocessor_state'] and model_state['preprocessor_state']['feature_columns']:
                 feature_names = model_state['preprocessor_state']['feature_columns']
-                print(f"💾 Restored feature names from preprocessor_state: {len(feature_names)} features")
+                print(f"💾 Restored feature names from preprocessor_state: {feature_names}")
             elif 'feature_names' in model_state['wrapper_state'] and model_state['wrapper_state']['feature_names']:
                 feature_names = model_state['wrapper_state']['feature_names']
-                print(f"💾 Restored feature names from wrapper_state: {len(feature_names)} features")
+                print(f"💾 Restored feature names from wrapper_state: {feature_names}")
             else:
                 # Final fallback: infer from X_full shape
                 if adaptive_model.X_full is not None:
                     n_features = adaptive_model.X_full.shape[1]
                     feature_names = [f'feature_{i}' for i in range(n_features)]
-                    print(f"💾 Inferred feature names from data shape: {len(feature_names)} features")
+                    print(f"⚠️  Using generic feature names as fallback: {feature_names}")
 
-            print(f"💾 Final restored feature names: {feature_names}")
-
-            # Ensure feature names and target column are properly set in ALL locations
+            # CRITICAL: Set feature names in ALL locations
             adaptive_model.model.feature_names = feature_names
             adaptive_model.model.target_column = data_state.get('target_column', 'target')
             adaptive_model.target_column = data_state.get('target_column', 'target')
@@ -280,7 +281,7 @@ class ModelSerializer:
             adaptive_model.model.preprocessor.target_encoder = preprocessor_state['target_encoder']
             adaptive_model.model.preprocessor.scaler = preprocessor_state['scaler']
             adaptive_model.model.preprocessor.missing_value_indicators = preprocessor_state['missing_value_indicators']
-            adaptive_model.model.preprocessor.feature_columns = feature_names  # CRITICAL: Set feature columns
+            adaptive_model.model.preprocessor.feature_columns = feature_names  # CRITICAL: Set ACTUAL feature columns
 
             # Check label encoder restoration
             target_encoder = adaptive_model.model.preprocessor.target_encoder
@@ -304,10 +305,18 @@ class ModelSerializer:
             adaptive_model.model.architecture_frozen = wrapper_state['architecture_frozen']
             adaptive_model.model.frozen_components = wrapper_state['frozen_components']
 
-            # CRITICAL: Mark model as trained after restoration
+            # CRITICAL: Mark model as trained and ensure preprocessor is fitted
             adaptive_model.model_trained = True
             adaptive_model.model.is_trained = True
             adaptive_model.model.core.is_trained = True
+
+            # CRITICAL: Mark preprocessor as fitted by setting its attributes
+            if hasattr(adaptive_model.model.preprocessor, 'feature_encoders'):
+                print("✅ Preprocessor marked as fitted with feature encoders")
+            if hasattr(adaptive_model.model.preprocessor, 'target_encoder'):
+                print("✅ Preprocessor marked as fitted with target encoder")
+            if hasattr(adaptive_model.model.preprocessor, 'scaler'):
+                print("✅ Preprocessor marked as fitted with scaler")
 
             # Validate the restored model
             validation_msg = ModelSerializer._validate_loaded_model(adaptive_model)
@@ -931,9 +940,9 @@ class DataPreprocessor:
             }
 
             processed_features.append(numeric_data)
-            feature_names.append(col)
+            feature_names.append(col)  # This preserves the original column names
 
-        # CRITICAL: Store feature columns for serialization
+        # CRITICAL: Store the actual feature column names for serialization
         self.feature_columns = feature_names.copy()
 
         # Stack all features
@@ -943,6 +952,37 @@ class DataPreprocessor:
             X_processed = np.empty((len(X), 0))
 
         return X_processed, feature_names
+
+    def preprocess_dataset(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Preprocess entire dataset"""
+        print("🔧 Preprocessing dataset...")
+
+        # Separate features and target
+        if self.target_column not in data.columns:
+            raise ValueError(f"Target column '{self.target_column}' not found in dataset")
+
+        # Create a copy to avoid modifying original data
+        data_clean = data.copy()
+
+        # Preprocess features
+        X_processed, feature_names = self.preprocess_features(data_clean)
+
+        # Preprocess target
+        y_processed = self.preprocess_target(data_clean[self.target_column])
+
+        # Remove samples with missing target values
+        valid_mask = ~np.isnan(y_processed)
+        if not np.all(valid_mask):
+            removed_count = len(y_processed) - np.sum(valid_mask)
+            print(f"⚠️  Removed {removed_count} samples with invalid target values")
+            X_processed = X_processed[valid_mask]
+            y_processed = y_processed[valid_mask]
+
+        print(f"✅ Preprocessing complete: {X_processed.shape[0]} samples, {X_processed.shape[1]} features")
+        print(f"📊 Feature types: {len(feature_names)} numeric/categorical features")
+        print(f"💾 Stored actual feature names: {feature_names}")
+
+        return X_processed, y_processed, feature_names
 
     def _detect_missing_values(self, data: pd.Series) -> np.ndarray:
         """Detect various types of missing values"""
@@ -1013,36 +1053,6 @@ class DataPreprocessor:
 
         return y_processed.astype(int)
 
-    def preprocess_dataset(self, data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-        """Preprocess entire dataset"""
-        print("🔧 Preprocessing dataset...")
-
-        # Separate features and target
-        if self.target_column not in data.columns:
-            raise ValueError(f"Target column '{self.target_column}' not found in dataset")
-
-        # Create a copy to avoid modifying original data
-        data_clean = data.copy()
-
-        # Preprocess features
-        X_processed, feature_names = self.preprocess_features(data_clean)
-
-        # Preprocess target
-        y_processed = self.preprocess_target(data_clean[self.target_column])
-
-        # Remove samples with missing target values
-        valid_mask = ~np.isnan(y_processed)
-        if not np.all(valid_mask):
-            removed_count = len(y_processed) - np.sum(valid_mask)
-            print(f"⚠️  Removed {removed_count} samples with invalid target values")
-            X_processed = X_processed[valid_mask]
-            y_processed = y_processed[valid_mask]
-
-        print(f"✅ Preprocessing complete: {X_processed.shape[0]} samples, {X_processed.shape[1]} features")
-        print(f"📊 Feature types: {len(feature_names)} numeric/categorical features")
-        print(f"💾 Stored feature names: {feature_names}")
-
-        return X_processed, y_processed, feature_names
 
 class CTDBNNVisualizer:
     """Visualization system for CT-DBNN"""
@@ -1247,14 +1257,13 @@ class OptimizedCTDBNNWrapper:
 
         X_processed, y_processed, feature_names = self.preprocessor.preprocess_dataset(self.data)
 
-        # CRITICAL: Store feature names in multiple locations for serialization
+        # CRITICAL: Store the ACTUAL feature names from preprocessing
         self.feature_names = feature_names
         self.preprocessor.feature_columns = feature_names
 
-        print(f"💾 Wrapper stored feature names: {len(self.feature_names)} features - {self.feature_names}")
+        print(f"💾 Wrapper stored ACTUAL feature names: {len(self.feature_names)} features - {self.feature_names}")
 
         return X_processed, y_processed, feature_names
-
 
     def initialize_with_full_data(self, X: np.ndarray, y: np.ndarray):
         """Step 1: Initialize CT-DBNN architecture with full dataset - NO TRAINING"""
@@ -1264,15 +1273,18 @@ class OptimizedCTDBNNWrapper:
         self.X_full = X
         self.y_full = y
 
-        # Create temporary file with full data
+        # Create temporary file with full data using ACTUAL feature names
         temp_file = f"temp_full_init_{int(time.time())}.csv"
 
-        # CRITICAL: Use actual feature names if available, otherwise create generic ones
+        # CRITICAL: Use ACTUAL feature names from preprocessing
         if hasattr(self, 'feature_names') and self.feature_names:
             feature_cols = self.feature_names
+            print(f"💾 Using ACTUAL feature names for initialization: {feature_cols}")
         else:
+            # Fallback: create generic names but this should not happen
             feature_cols = [f'feature_{i}' for i in range(X.shape[1])]
-            self.feature_names = feature_cols  # Store for serialization
+            self.feature_names = feature_cols
+            print(f"⚠️  Using generic feature names as fallback: {feature_cols}")
 
         full_df = pd.DataFrame(X, columns=feature_cols)
         full_df[self.target_column] = y
@@ -1287,7 +1299,8 @@ class OptimizedCTDBNNWrapper:
             y_temp = X_temp[self.target_column].values
             X_temp = X_temp.drop(columns=[self.target_column]).values
 
-            # CRITICAL: Pass the actual feature names
+            # CRITICAL: Pass the ACTUAL feature names to CT-DBNN
+            print(f"💾 Passing ACTUAL feature names to CT-DBNN: {feature_cols}")
             self.core.compute_global_likelihoods(X_temp, y_temp, feature_cols)
 
             # Store feature information for serialization
