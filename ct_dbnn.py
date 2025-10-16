@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-OPTIMIZED CT-DBNN MODULE - Fixed GUI and Confidence Issues
+OPTIMIZED CT-DBNN MODULE - Fixed Label Encoding Consistency
+WITH PROPER LABEL HANDLING ACROSS TRAINING AND PREDICTION
 """
 
 import numpy as np
@@ -35,9 +36,249 @@ except ImportError:
     GUI_AVAILABLE = False
 
 
+class DataPreprocessor:
+    """
+    Comprehensive data preprocessing with CONSISTENT label encoding
+    """
+
+    def __init__(self, missing_value_placeholder=-99999):
+        self.missing_value_placeholder = missing_value_placeholder
+        self.feature_encoders = {}  # encoders for each feature column
+        self.target_encoder = None  # encoder for target column
+        self.target_decoder = None  # decoder for target column
+        self.feature_columns = None
+        self.target_column = None
+        self.original_dtypes = {}
+        self.is_fitted = False
+
+    def fit_transform_features(self, features):
+        """Fit and transform features with label encoding and missing value handling"""
+        if isinstance(features, pd.DataFrame):
+            result = self._fit_transform_dataframe(features)
+        elif isinstance(features, np.ndarray):
+            result = self._fit_transform_array(features)
+        else:
+            # Convert to numpy array and process
+            features_array = np.array(features)
+            result = self._fit_transform_array(features_array)
+
+        self.is_fitted = True
+        return result
+
+    def _fit_transform_dataframe(self, df):
+        """Fit and transform DataFrame features"""
+        self.feature_columns = list(df.columns)
+        self.original_dtypes = df.dtypes.to_dict()
+
+        processed_data = df.copy()
+        self.feature_encoders = {}
+
+        for col in df.columns:
+            # Handle missing values
+            if df[col].isna().any():
+                processed_data[col] = df[col].fillna(self.missing_value_placeholder)
+
+            # Convert to numeric if possible, otherwise use label encoding
+            if df[col].dtype == 'object' or isinstance(df[col].dtype, pd.CategoricalDtype):
+                # Label encoding for categorical data
+                unique_vals = processed_data[col].unique()
+                encoder = {val: idx for idx, val in enumerate(unique_vals)}
+                self.feature_encoders[col] = encoder
+                processed_data[col] = processed_data[col].map(encoder)
+            else:
+                # Keep numeric data as is, but store identity encoder
+                self.feature_encoders[col] = 'numeric'
+
+        return processed_data.values.astype(np.float64)
+
+    def _fit_transform_array(self, array):
+        """Fit and transform numpy array features"""
+        processed_data = array.copy().astype(object)
+        n_samples, n_features = array.shape
+        self.feature_columns = [f'Feature_{i+1}' for i in range(n_features)]
+        self.feature_encoders = {}
+
+        for col_idx in range(n_features):
+            col_data = array[:, col_idx]
+
+            # Handle missing values
+            missing_mask = pd.isna(col_data) if hasattr(pd, 'isna') else (
+                (col_data == None) | ((isinstance(col_data, str)) & ((col_data == 'NaN') | (col_data == 'NA') | (col_data == '')))
+            )
+            if np.any(missing_mask):
+                processed_data[missing_mask, col_idx] = self.missing_value_placeholder
+
+            # Check if column needs encoding (non-numeric)
+            try:
+                # Try to convert to numeric
+                numeric_data = pd.to_numeric(processed_data[:, col_idx], errors='coerce')
+                non_numeric_mask = pd.isna(numeric_data)
+                if np.any(non_numeric_mask):
+                    # Contains non-numeric values, need encoding
+                    unique_vals = np.unique(processed_data[:, col_idx])
+                    encoder = {val: idx for idx, val in enumerate(unique_vals)}
+                    self.feature_encoders[col_idx] = encoder
+                    for i, val in enumerate(processed_data[:, col_idx]):
+                        processed_data[i, col_idx] = encoder.get(val, 0)
+                else:
+                    # All numeric
+                    processed_data[:, col_idx] = numeric_data
+                    self.feature_encoders[col_idx] = 'numeric'
+            except:
+                # Fallback: treat as categorical
+                unique_vals = np.unique(processed_data[:, col_idx])
+                encoder = {val: idx for idx, val in enumerate(unique_vals)}
+                self.feature_encoders[col_idx] = encoder
+                for i, val in enumerate(processed_data[:, col_idx]):
+                    processed_data[i, col_idx] = encoder.get(val, 0)
+
+        return processed_data.astype(np.float64)
+
+    def transform_features(self, features):
+        """Transform features using fitted encoders"""
+        if not self.is_fitted:
+            raise ValueError("Preprocessor must be fitted first")
+
+        if isinstance(features, pd.DataFrame):
+            return self._transform_dataframe(features)
+        elif isinstance(features, np.ndarray):
+            return self._transform_array(features)
+        else:
+            features_array = np.array(features)
+            return self._transform_array(features_array)
+
+    def _transform_dataframe(self, df):
+        """Transform DataFrame features using fitted encoders"""
+        processed_data = df.copy()
+
+        for col in df.columns:
+            if col not in self.feature_encoders:
+                raise ValueError(f"Column {col} not seen during fitting")
+
+            # Handle missing values
+            if df[col].isna().any():
+                processed_data[col] = df[col].fillna(self.missing_value_placeholder)
+
+            # Apply encoding if needed
+            if self.feature_encoders[col] != 'numeric':
+                encoder = self.feature_encoders[col]
+                processed_data[col] = processed_data[col].map(
+                    lambda x: encoder.get(x, 0) if x in encoder else 0
+                )
+
+        return processed_data.values.astype(np.float64)
+
+    def _transform_array(self, array):
+        """Transform numpy array features using fitted encoders"""
+        processed_data = array.copy().astype(object)
+        n_samples, n_features = array.shape
+
+        for col_idx in range(n_features):
+            if col_idx not in self.feature_encoders:
+                raise ValueError(f"Column index {col_idx} not seen during fitting")
+
+            col_data = array[:, col_idx]
+
+            # Handle missing values
+            missing_mask = pd.isna(col_data) if hasattr(pd, 'isna') else (
+                (col_data == None) | ((isinstance(col_data, str)) & ((col_data == 'NaN') | (col_data == 'NA') | (col_data == '')))
+            )
+            if np.any(missing_mask):
+                processed_data[missing_mask, col_idx] = self.missing_value_placeholder
+
+            # Apply encoding if needed
+            if self.feature_encoders[col_idx] != 'numeric':
+                encoder = self.feature_encoders[col_idx]
+                for i, val in enumerate(processed_data[:, col_idx]):
+                    processed_data[i, col_idx] = encoder.get(val, 0)
+            else:
+                # Convert to numeric
+                try:
+                    processed_data[:, col_idx] = pd.to_numeric(processed_data[:, col_idx], errors='coerce')
+                    processed_data[pd.isna(processed_data[:, col_idx]), col_idx] = self.missing_value_placeholder
+                except:
+                    processed_data[:, col_idx] = self.missing_value_placeholder
+
+        return processed_data.astype(np.float64)
+
+    def fit_transform_targets(self, targets):
+        """Fit and transform targets with label encoding - STORE BOTH ENCODER AND DECODER"""
+        targets_data = self._extract_targets(targets)
+        self.target_encoder = {}
+        self.target_decoder = {}
+
+        unique_vals = np.unique(targets_data)
+        for idx, val in enumerate(unique_vals):
+            encoded_val = float(idx + 1)
+            self.target_encoder[val] = encoded_val
+            self.target_decoder[encoded_val] = val
+
+        encoded = np.array([self.target_encoder[val] for val in targets_data])
+        return encoded.astype(np.float64)
+
+    def transform_targets(self, targets):
+        """Transform targets using fitted encoder"""
+        if self.target_encoder is None:
+            raise ValueError("Target encoder not fitted")
+
+        targets_data = self._extract_targets(targets)
+        encoded = np.array([self.target_encoder.get(val, 0.0) for val in targets_data])
+        return encoded.astype(np.float64)
+
+    def inverse_transform_targets(self, encoded_targets):
+        """Convert encoded targets back to original labels"""
+        if self.target_decoder is None:
+            raise ValueError("Target decoder not fitted")
+
+        if isinstance(encoded_targets, (pd.Series, pd.DataFrame)):
+            original = encoded_targets.map(lambda x: self.target_decoder.get(x, "Unknown"))
+        else:
+            original = np.array([self.target_decoder.get(x, "Unknown") for x in encoded_targets])
+
+        return original
+
+    def _extract_targets(self, targets):
+        """Extract targets array from various input types"""
+        if hasattr(targets, 'target'):
+            return np.array(targets.target)
+        elif isinstance(targets, np.ndarray):
+            return targets
+        elif isinstance(targets, pd.Series):
+            return targets.values
+        elif isinstance(targets, pd.DataFrame):
+            return targets.values.flatten()
+        else:
+            try:
+                return np.array(targets)
+            except:
+                raise ValueError(f"Unsupported targets type: {type(targets)}")
+
+    def get_feature_info(self):
+        """Get information about feature encoding"""
+        info = {
+            'missing_value_placeholder': self.missing_value_placeholder,
+            'feature_encoders': {},
+            'target_encoder': self.target_encoder,
+            'target_decoder': self.target_decoder,
+            'is_fitted': self.is_fitted
+        }
+
+        for col, encoder in self.feature_encoders.items():
+            if encoder == 'numeric':
+                info['feature_encoders'][col] = 'numeric'
+            else:
+                info['feature_encoders'][col] = {
+                    'type': 'categorical',
+                    'mapping': encoder,
+                    'num_categories': len(encoder)
+                }
+
+        return info
+
+
 class ParallelCTDBNN:
     """
-    Optimized CT-DBNN with parallel processing
+    Optimized CT-DBNN with CONSISTENT label handling across all operations
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -49,9 +290,15 @@ class ParallelCTDBNN:
             'parallel_processing': True,
             'n_jobs': -1,
             'batch_size': 1000,
+            'missing_value_placeholder': -99999,
         }
         if config:
             self.config.update(config)
+
+        # Data preprocessor
+        self.preprocessor = DataPreprocessor(
+            missing_value_placeholder=self.config['missing_value_placeholder']
+        )
 
         # Determine number of workers
         if self.config['n_jobs'] == -1:
@@ -61,7 +308,7 @@ class ParallelCTDBNN:
 
         print(f"🔄 Parallel processing: {self.n_jobs} workers")
 
-        # Global data structures
+        # Global data structures - COMPUTED ONCE DURING TRAINING
         self.global_anti_net = None
         self.binloc = None
         self.max_val = None
@@ -69,14 +316,15 @@ class ParallelCTDBNN:
         self.dmyclass = None
         self.resolution_arr = None
 
-        # Weight structures
+        # Weight structures - COMPUTED ONCE DURING TRAINING
         self.anti_wts = None
         self.complex_weights = None
 
         # State
         self.innodes = 0
         self.outnodes = 0
-        self.class_encoder = None
+        self.class_to_encoded = None
+        self.encoded_to_class = None
         self.is_trained = False
         self.likelihoods_computed = False
 
@@ -92,45 +340,25 @@ class ParallelCTDBNN:
             'config': self.config.copy()
         }
 
-    def _fit_encoder(self, targets):
-        """Fit class encoder"""
-        targets_data = self._extract_targets(targets)
-        unique_classes = sorted(set(targets_data))
-        self.outnodes = len(unique_classes)
-
-        self.class_to_encoded = {}
-        self.encoded_to_class = {}
-
-        for encoded_val, original_class in enumerate(unique_classes, 1):
-            self.class_to_encoded[original_class] = float(encoded_val)
-            self.encoded_to_class[float(encoded_val)] = original_class
-
-        self.dmyclass = np.zeros(self.outnodes + 2, dtype=np.float64)
-        self.dmyclass[0] = 0.2
-
-        for i, original_class in enumerate(unique_classes, 1):
-            self.dmyclass[i] = float(i)
-
-        print(f"Encoded {self.outnodes} classes: {list(unique_classes)}")
-
-    def _transform_targets(self, targets):
-        """Transform targets to encoded indices"""
-        targets_data = self._extract_targets(targets)
-        return np.array([self.class_to_encoded[t] for t in targets_data])
+        # Store normalized training features for consistent processing
+        self.training_features_norm = None
+        self.training_targets_encoded = None
 
     def compute_global_likelihoods(self, features, targets, feature_names=None):
         """
-        Compute global likelihoods ONCE on entire dataset
+        Compute global likelihoods ONCE on entire dataset with comprehensive preprocessing
+        This is called ONLY during training
         """
         if self.likelihoods_computed:
             print("⚠️  Likelihoods already computed! Using existing global likelihoods.")
-            return self._normalize_features(features)
+            return self.training_features_norm
 
         print("Computing GLOBAL likelihoods on entire dataset...")
+        print("🔧 Applying comprehensive data preprocessing...")
 
-        # Extract numpy arrays from inputs
-        features_data = self._extract_features(features)
-        targets_data = self._extract_targets(targets)
+        # Preprocess features and targets - STORE THE PREPROCESSOR STATE
+        features_processed = self.preprocessor.fit_transform_features(features)
+        self.training_targets_encoded = self.preprocessor.fit_transform_targets(targets)
 
         # Store feature names
         if feature_names is not None:
@@ -138,16 +366,17 @@ class ParallelCTDBNN:
         elif hasattr(features, 'columns'):
             self.feature_names = list(features.columns)
         else:
-            self.feature_names = [f'Feature_{i+1}' for i in range(features_data.shape[1])]
+            self.feature_names = [f'Feature_{i+1}' for i in range(features_processed.shape[1])]
 
-        n_samples, n_features = features_data.shape
+        n_samples, n_features = features_processed.shape
         self.innodes = n_features
         resol = self.config['resol']
 
-        print(f"Data shape: {features_data.shape}, Resolution: {resol}")
+        print(f"Data shape: {features_processed.shape}, Resolution: {resol}")
+        print(f"Missing values replaced with: {self.config['missing_value_placeholder']}")
 
-        # Step 1: Fit encoder
-        self._fit_encoder(targets_data)
+        # Step 1: Fit encoder - USE THE SAME ENCODING AS PREPROCESSOR
+        self._fit_encoder_consistent()
 
         # Initialize global arrays with proper dimensions
         self.max_val = np.zeros(n_features + 2, dtype=np.float64)
@@ -157,20 +386,31 @@ class ParallelCTDBNN:
         # Initialize binloc with proper dimensions
         self.binloc = np.zeros((n_features + 2, resol + 8), dtype=np.float64)
 
-        # Compute global min/max
+        # Compute global min/max (ignoring missing values) - STORE FOR CONSISTENT NORMALIZATION
         for i in range(n_features):
             feature_idx = i + 1
-            self.max_val[feature_idx] = np.max(features_data[:, i])
-            self.min_val[feature_idx] = np.min(features_data[:, i])
+            feature_data = features_processed[:, i]
+
+            # Filter out missing values for min/max calculation
+            valid_mask = feature_data != self.config['missing_value_placeholder']
+            valid_data = feature_data[valid_mask]
+
+            if len(valid_data) > 0:
+                self.max_val[feature_idx] = np.max(valid_data)
+                self.min_val[feature_idx] = np.min(valid_data)
+            else:
+                self.max_val[feature_idx] = 1.0
+                self.min_val[feature_idx] = 0.0
+
             self.resolution_arr[feature_idx] = resol
 
             # Initialize bin locations
             for j in range(1, resol + 1):
                 self.binloc[feature_idx][j] = (j - 1) * 1.0
 
-        # Normalize features
-        features_norm = self._normalize_features(features_data)
-        encoded_targets = self._transform_targets(targets_data)
+        # Normalize features (missing values remain as placeholder during normalization)
+        # STORE THE NORMALIZED FEATURES FOR CONSISTENT PROCESSING
+        self.training_features_norm = self._normalize_features(features_processed)
 
         # Initialize global network counts with proper dimensions
         self.global_anti_net = np.zeros(
@@ -178,25 +418,42 @@ class ParallelCTDBNN:
             dtype=np.float64
         )
 
-        # Build global likelihoods
-        total_samples = len(features_norm)
+        # Build global likelihoods (skip samples with too many missing values)
+        total_samples = len(self.training_features_norm)
         print(f"Building global likelihoods from {total_samples} samples...")
 
+        valid_samples = 0
         for sample_idx in range(total_samples):
-            bins = self._find_closest_bins(features_norm[sample_idx, :])
+            # Skip samples that are entirely missing values
+            sample_data = self.training_features_norm[sample_idx, :]
+            missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
+
+            if missing_count >= n_features:  # Skip if all features are missing
+                continue
+
+            valid_samples += 1
+            bins = self._find_closest_bins(sample_data)
 
             for i in range(n_features):
                 feature_i = i + 1
                 bin_i = bins[i] + 1
 
+                # Skip if this feature is missing
+                if self.training_features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
+                    continue
+
                 for l in range(n_features):
                     feature_l = l + 1
                     bin_l = bins[l] + 1
 
-                    # Find correct class for this sample
+                    # Skip if this feature is missing
+                    if self.training_features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
+                        continue
+
+                    # Find correct class for this sample - USE ENCODED TARGETS
                     k_class = 1
                     while (k_class <= self.outnodes and
-                           abs(encoded_targets[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
+                           abs(self.training_targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
                         k_class += 1
 
                     if k_class <= self.outnodes:
@@ -205,6 +462,8 @@ class ParallelCTDBNN:
 
             if sample_idx > 0 and sample_idx % 50 == 0:
                 print(f"  Processed {sample_idx}/{total_samples} samples...")
+
+        print(f"✅ Used {valid_samples} valid samples (excluding entirely missing samples)")
 
         # Apply smoothing
         smoothing = self.config['smoothing_factor']
@@ -219,39 +478,33 @@ class ParallelCTDBNN:
         self.likelihoods_computed = True
         print("✅ Global likelihoods computed and fixed")
 
-        return features_norm
+        return self.training_features_norm
 
-    def _extract_features(self, features):
-        """Extract features array from various input types"""
-        if hasattr(features, 'data'):
-            return np.array(features.data)
-        elif isinstance(features, np.ndarray):
-            return features
-        elif isinstance(features, pd.DataFrame):
-            return features.values
-        else:
-            try:
-                return np.array(features)
-            except:
-                raise ValueError(f"Unsupported features type: {type(features)}")
+    def _fit_encoder_consistent(self):
+        """Fit class encoder - CONSISTENT with preprocessor encoding"""
+        if self.preprocessor.target_encoder is None:
+            raise ValueError("Preprocessor target encoder not fitted")
 
-    def _extract_targets(self, targets):
-        """Extract targets array from various input types"""
-        if hasattr(targets, 'target'):
-            return np.array(targets.target)
-        elif isinstance(targets, np.ndarray):
-            return targets
-        elif isinstance(targets, pd.Series):
-            return targets.values
-        else:
-            try:
-                return np.array(targets)
-            except:
-                raise ValueError(f"Unsupported targets type: {type(targets)}")
+        # USE THE SAME ENCODING AS THE PREPROCESSOR
+        self.class_to_encoded = self.preprocessor.target_encoder
+        self.encoded_to_class = self.preprocessor.target_decoder
+
+        unique_classes = list(self.class_to_encoded.keys())
+        self.outnodes = len(unique_classes)
+
+        self.dmyclass = np.zeros(self.outnodes + 2, dtype=np.float64)
+        self.dmyclass[0] = 0.2
+
+        for i, original_class in enumerate(unique_classes, 1):
+            self.dmyclass[i] = self.class_to_encoded[original_class]
+
+        print(f"Encoded {self.outnodes} classes: {unique_classes}")
+        print(f"Encoding mapping: {self.class_to_encoded}")
 
     def initialize_orthogonal_weights(self):
         """
         ONE-STEP ORTHOGONALIZATION in Complex Tensor Space
+        Called ONLY during training
         """
         if not self.likelihoods_computed:
             raise ValueError("Must compute global likelihoods first!")
@@ -283,7 +536,7 @@ class ParallelCTDBNN:
                             for k in range(1, self.outnodes + 1):
                                 self.complex_weights[i, j, l, m, k] = complex_phases[k-1]
 
-            # Convert to real weights (magnitude)
+            # Convert to real weights (magnitude) - STORE FOR CONSISTENT PREDICTION
             self.anti_wts = np.abs(self.complex_weights)
 
         else:
@@ -298,6 +551,7 @@ class ParallelCTDBNN:
     def compute_class_probabilities(self, features_norm, sample_idx):
         """
         FIXED: Enhanced probability computation with proper normalization
+        Uses precomputed likelihoods and orthogonal weights
         """
         classval = np.ones(self.outnodes + 2)
         bins = self._find_closest_bins(features_norm[sample_idx, :])
@@ -312,17 +566,27 @@ class ParallelCTDBNN:
             feature_i = i + 1
             bin_i = bins[i] + 1
 
+            # Skip if this feature is missing
+            if features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
+                continue
+
             for l in range(n_features):
                 feature_l = l + 1
                 bin_l = bins[l] + 1
 
+                # Skip if this feature is missing
+                if features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
+                    continue
+
                 for k in range(1, self.outnodes + 1):
                     if self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] > 0:
+                        # Use precomputed likelihoods from training
                         likelihood = (self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k] /
                                     self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0])
                     else:
                         likelihood = 1.0 / self.outnodes
 
+                    # Use precomputed orthogonal weights from training
                     weight = self.anti_wts[feature_i, bin_i, feature_l, bin_l, k]
 
                     # Use log to prevent underflow
@@ -347,6 +611,7 @@ class ParallelCTDBNN:
     def train(self, features_train, targets_train):
         """
         ONE-STEP TRAINING with orthogonal weight initialization
+        Computes and stores ALL model parameters
         """
         if not self.likelihoods_computed:
             raise ValueError("Must compute global likelihoods first!")
@@ -354,23 +619,20 @@ class ParallelCTDBNN:
         print("🚀 ONE-STEP training with orthogonal weights...")
         start_time = time.time()
 
-        # Extract numpy arrays
-        features_data = self._extract_features(features_train)
-        targets_data = self._extract_targets(targets_train)
+        # Use preprocessed features from likelihood computation
+        if self.training_features_norm is None:
+            raise ValueError("Training features not available. Call compute_global_likelihoods first.")
 
-        encoded_targets = self._transform_targets(targets_data)
-        features_norm = self._normalize_features(features_data)
-
-        # One-step orthogonal weight initialization
+        # One-step orthogonal weight initialization - STORES WEIGHTS
         self.initialize_orthogonal_weights()
 
-        # Evaluate initial accuracy (no iterations needed)
-        n_samples = len(features_norm)
+        # Evaluate training accuracy using precomputed likelihoods and weights
+        n_samples = len(self.training_features_norm)
         correct_predictions = 0
         probabilities = []
 
         for sample_idx in range(n_samples):
-            classval = self.compute_class_probabilities(features_norm, sample_idx)
+            classval = self.compute_class_probabilities(self.training_features_norm, sample_idx)
             probabilities.append(classval[1:self.outnodes+1])
 
             kmax = 1
@@ -380,7 +642,8 @@ class ParallelCTDBNN:
                     cmax = classval[k]
                     kmax = k
 
-            actual = encoded_targets[sample_idx]
+            # Use the SAME encoded targets from likelihood computation
+            actual = self.training_targets_encoded[sample_idx]
             predicted = self.dmyclass[kmax]
 
             if abs(actual - predicted) <= self.dmyclass[0]:
@@ -406,37 +669,51 @@ class ParallelCTDBNN:
         return training_time
 
     def _normalize_features(self, features):
-        """Normalize features using global min/max"""
+        """Normalize features using stored global min/max from training"""
         if not isinstance(features, np.ndarray):
-            features = self._extract_features(features)
+            features = np.array(features)
 
         if not hasattr(self, 'max_val') or self.max_val is None:
-            n_samples, n_features = features.shape
-            return np.zeros((n_samples, n_features))
+            raise ValueError("Model not trained. Min/max values not available.")
 
         n_features = self.innodes
         features_norm = np.zeros_like(features, dtype=np.float64)
 
         for i in range(n_features):
             feature_idx = i + 1
+            feature_data = features[:, i]
+
+            # Preserve missing values
+            missing_mask = feature_data == self.config['missing_value_placeholder']
+
             feature_range = self.max_val[feature_idx] - self.min_val[feature_idx]
             if feature_range > 0:
-                normalized = (features[:, i] - self.min_val[feature_idx]) / feature_range
+                normalized = (feature_data - self.min_val[feature_idx]) / feature_range
                 normalized = np.clip(normalized, 0, 1)
-                features_norm[:, i] = normalized * (self.resolution_arr[feature_idx] - 1)
+                normalized = normalized * (self.resolution_arr[feature_idx] - 1)
+
+                # Restore missing values
+                normalized[missing_mask] = self.config['missing_value_placeholder']
+                features_norm[:, i] = normalized
             else:
-                features_norm[:, i] = 0
+                features_norm[:, i] = self.config['missing_value_placeholder'] if np.any(missing_mask) else 0
 
         return features_norm
 
     def _find_closest_bins(self, feature_vector):
-        """Find closest bins for a feature vector"""
+        """Find closest bins for a feature vector, handling missing values"""
         n_features = self.innodes
         bins = np.zeros(n_features, dtype=np.int32)
 
         for i in range(n_features):
             feature_idx = i + 1
             value = feature_vector[i]
+
+            # If value is missing, assign to bin 0
+            if value == self.config['missing_value_placeholder']:
+                bins[i] = 0
+                continue
+
             resolution_val = self.resolution_arr[feature_idx]
 
             min_dist = 2.0 * resolution_val
@@ -456,17 +733,21 @@ class ParallelCTDBNN:
         return bins
 
     def predict_proba(self, features):
-        """Predict class probabilities"""
-        if not self.likelihoods_computed:
-            raise ValueError("Must compute global likelihoods first!")
+        """Predict class probabilities using precomputed model parameters"""
+        if not self.likelihoods_computed or not self.is_trained:
+            raise ValueError("Model must be trained first!")
 
-        features_data = self._extract_features(features)
-        features_norm = self._normalize_features(features_data)
+        # Preprocess features using the SAME preprocessor from training
+        features_processed = self.preprocessor.transform_features(features)
+
+        # Normalize using the SAME min/max from training
+        features_norm = self._normalize_features(features_processed)
         n_samples = len(features_norm)
 
         probabilities = np.zeros((n_samples, self.outnodes))
 
         for sample_idx in range(n_samples):
+            # Use precomputed likelihoods and orthogonal weights
             classval = self.compute_class_probabilities(features_norm, sample_idx)
             for k in range(1, self.outnodes + 1):
                 probabilities[sample_idx, k-1] = classval[k]
@@ -474,13 +755,15 @@ class ParallelCTDBNN:
         return probabilities
 
     def predict(self, features):
-        """Predict class labels"""
+        """Predict class labels using precomputed model parameters"""
         probabilities = self.predict_proba(features)
         predictions_encoded = np.argmax(probabilities, axis=1) + 1
 
+        # Convert encoded predictions back to original class labels using SAME decoder
         predictions = []
         for pred_enc in predictions_encoded:
-            predictions.append(self.encoded_to_class[float(pred_enc)])
+            original_class = self.encoded_to_class.get(float(pred_enc), "Unknown")
+            predictions.append(original_class)
 
         max_probs = np.max(probabilities, axis=1)
         print(f"📊 Prediction confidence - Min: {np.min(max_probs):.4f}, "
@@ -489,11 +772,23 @@ class ParallelCTDBNN:
         return np.array(predictions)
 
     def evaluate(self, features, targets):
-        """Evaluate model accuracy"""
+        """Evaluate model accuracy using CONSISTENT label handling"""
+        # Get predictions (already in original labels)
         predictions = self.predict(features)
-        targets_data = self._extract_targets(targets)
-        accuracy = accuracy_score(targets_data, predictions)
+
+        # Convert targets to original labels for comparison
+        targets_original = self.preprocessor.inverse_transform_targets(
+            self.preprocessor.transform_targets(targets)
+        )
+
+        accuracy = accuracy_score(targets_original, predictions)
         self.training_history['test_accuracy'] = accuracy
+
+        print(f"🔍 Evaluation Details:")
+        print(f"   Predictions sample: {predictions[:10]}")
+        print(f"   Actual targets sample: {targets_original[:10]}")
+        print(f"   Match count: {np.sum(predictions == targets_original)}/{len(predictions)}")
+
         return accuracy
 
     def plot_feature_importance(self):
@@ -540,7 +835,7 @@ class ParallelCTDBNN:
             print(f"Error plotting feature importance: {e}")
 
     def save_model(self, filepath: str):
-        """Save model to file"""
+        """Save model to file including ALL precomputed parameters"""
         model_data = {
             'config': self.config,
             'global_anti_net': self.global_anti_net,
@@ -559,6 +854,9 @@ class ParallelCTDBNN:
             'likelihoods_computed': self.likelihoods_computed,
             'training_history': self.training_history,
             'feature_names': self.feature_names,
+            'preprocessor': self.preprocessor,
+            'training_features_norm': self.training_features_norm,
+            'training_targets_encoded': self.training_targets_encoded,
         }
 
         with open(filepath, 'wb') as f:
@@ -566,7 +864,7 @@ class ParallelCTDBNN:
         print(f"✅ Model saved to {filepath}")
 
     def load_model(self, filepath: str):
-        """Load model from file"""
+        """Load model from file including ALL precomputed parameters"""
         with open(filepath, 'rb') as f:
             model_data = pickle.load(f)
 
@@ -576,16 +874,21 @@ class ParallelCTDBNN:
         print(f"✅ Model loaded from {filepath}")
 
     def get_model_info(self) -> Dict[str, Any]:
-        """Get model information"""
+        """Get comprehensive model information"""
         return {
-            'input_nodes': self.innodes,
-            'output_nodes': self.outnodes,
-            'is_trained': self.is_trained,
-            'likelihoods_computed': self.likelihoods_computed,
             'config': self.config,
-            'training_history': self.training_history,
-            'classes': list(self.encoded_to_class.values()),
-            'feature_names': self.feature_names,
+            'architecture': {
+                'input_nodes': self.innodes,
+                'output_nodes': self.outnodes,
+                'resolution': self.config['resol'],
+                'classes': list(self.encoded_to_class.values()) if self.encoded_to_class else []
+            },
+            'training': self.training_history,
+            'preprocessing': self.preprocessor.get_feature_info() if hasattr(self, 'preprocessor') else {},
+            'status': {
+                'is_trained': self.is_trained,
+                'likelihoods_computed': self.likelihoods_computed
+            }
         }
 
 
@@ -1161,6 +1464,95 @@ def main():
             root = tk.Tk()
             app = CTDBNNGUI(root)
             root.mainloop()
+
+
+def run_demo():
+    """Run demo with COMPLETE label consistency"""
+    print("🚀 Running CT-DBNN Demo with COMPLETE Label Consistency...")
+
+    # Load dataset
+    data = load_iris()
+    X, y = data.data, data.target
+    feature_names = data.feature_names
+
+    print(f"Original target classes: {np.unique(y)}")
+
+    # Add some categorical data and missing values for testing
+    np.random.seed(42)
+
+    # Add categorical feature
+    categorical_feature = np.random.choice(['A', 'B', 'C'], size=len(X))
+    X_with_categorical = np.column_stack([X, categorical_feature])
+    feature_names = list(feature_names) + ['Categorical_Feature']
+
+    # Add some missing values
+    mask = np.random.random(X_with_categorical.shape) < 0.05
+    X_with_categorical[mask] = np.nan
+
+    # Convert to DataFrame for better demonstration
+    df = pd.DataFrame(X_with_categorical, columns=feature_names)
+    print("Dataset shape:", df.shape)
+    print("Feature names:", feature_names)
+    print("Missing values:", df.isna().sum().sum())
+
+    # Split data - IMPORTANT: Use proper stratification
+    X_train, X_test, y_train, y_test = train_test_split(
+        df, y, test_size=0.3, random_state=42, stratify=y
+    )
+
+    print(f"Training set: {X_train.shape}, Test set: {X_test.shape}")
+    print(f"Training targets: {np.unique(y_train)}, Test targets: {np.unique(y_test)}")
+
+    # Initialize and train model
+    model = ParallelCTDBNN({
+        'resol': 8,
+        'use_complex_tensor': True,
+        'orthogonalize_weights': True,
+        'parallel_processing': True,
+        'missing_value_placeholder': -99999
+    })
+
+    # Compute global likelihoods (with preprocessing) - ONLY ONCE
+    print("\n🔧 Computing global likelihoods with preprocessing...")
+    features_norm = model.compute_global_likelihoods(X_train, y_train, feature_names)
+
+    # Train model - uses precomputed likelihoods
+    print("\n🎯 Training model...")
+    training_time = model.train(X_train, y_train)
+
+    # Evaluate - uses CONSISTENT label handling
+    print("\n📊 Evaluating model...")
+    test_accuracy = model.evaluate(X_test, y_test)
+    print(f"🎯 Test Accuracy: {test_accuracy:.4f}")
+
+    # Show model info
+    print("\n📋 Model Information:")
+    model_info = model.get_model_info()
+    print(f"Input Features: {model_info['architecture']['input_nodes']}")
+    print(f"Output Classes: {model_info['architecture']['output_nodes']}")
+    print(f"Classes: {model_info['architecture']['classes']}")
+    print(f"Training Time: {model_info['training']['training_time']:.3f}s")
+    print(f"Train Accuracy: {model_info['training']['train_accuracy']:.4f}")
+    print(f"Test Accuracy: {model_info['training']['test_accuracy']:.4f}")
+
+    # Show encoding details
+    print(f"\n🔧 Encoding Details:")
+    print(f"   Class to Encoded: {model.class_to_encoded}")
+    print(f"   Encoded to Class: {model.encoded_to_class}")
+
+    # Make predictions with confidence
+    print("\n🔮 Making predictions with confidence...")
+    probabilities = model.predict_proba(X_test[:5])
+    predictions = model.predict(X_test[:5])
+
+    # Get actual test targets in original format for comparison
+    actual_test_targets = y_test[:5]
+
+    for i, (pred, prob, actual) in enumerate(zip(predictions, probabilities, actual_test_targets)):
+        confidence = np.max(prob)
+        print(f"Sample {i+1}: Predicted={pred}, Actual={actual}, Match={pred==actual}, Confidence={confidence:.4f}")
+
+    return model
 
 
 if __name__ == "__main__":
