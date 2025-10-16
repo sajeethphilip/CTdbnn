@@ -14,6 +14,9 @@ import copy
 import glob
 import time
 import torch
+import pickle
+import gzip
+import shutil
 from scipy.stats import entropy
 from scipy.spatial.distance import jensenshannon
 from sklearn.cluster import KMeans
@@ -361,7 +364,7 @@ class UCIDatasetHandler:
 
     @staticmethod
     def create_uci_config(dataset_name: str, output_dir: str = ".") -> bool:
-        """Create configuration file for UCI dataset"""
+        """Create comprehensive configuration file for UCI dataset"""
         if dataset_name is None:
             return False
         dataset_name = dataset_name.lower()
@@ -380,6 +383,32 @@ class UCIDatasetHandler:
             'best_known_accuracy': dataset_info.get('best_accuracy', 'Unknown'),
             'best_known_method': dataset_info.get('best_method', 'Unknown'),
             'recommended_resolution': dataset_info.get('recommended_resolution', 100),
+
+            # CT-DBNN Core Hyperparameters
+            'ctdbnn_config': {
+                'resol': dataset_info.get('recommended_resolution', 100),
+                'use_complex_tensor': True,
+                'orthogonalize_weights': True,
+                'parallel_processing': True,
+                'smoothing_factor': 1e-8,
+                'n_jobs': -1,
+                'memory_safe': True,
+
+                # Advanced CT-DBNN parameters
+                'learning_rate': 0.01,
+                'max_epochs': 100,
+                'batch_size': 32,
+                'weight_decay': 1e-4,
+                'gradient_clip': 1.0,
+                'activation_function': 'relu',
+                'hidden_layers': [64, 32],
+                'dropout_rate': 0.2,
+                'batch_normalization': True,
+                'early_stopping_patience': 10,
+                'validation_split': 0.1,
+            },
+
+            # Adaptive Learning Hyperparameters
             'adaptive_learning': {
                 'enable_adaptive': True,
                 'initial_samples_per_class': 5,
@@ -387,13 +416,29 @@ class UCIDatasetHandler:
                 'patience': 10,
                 'min_improvement': 0.001,
                 'enable_acid_test': True,
+
+                # Advanced Adaptive Learning parameters
+                'divergence_threshold': 0.1,
+                'max_samples_per_round': 5,
+                'diversity_weight': 0.3,
+                'uncertainty_weight': 0.7,
+                'exploration_factor': 0.1,
+                'class_balancing': True,
+                'hard_sample_mining': True,
+                'confidence_threshold': 0.8,
+                'sample_selection_strategy': 'margin',  # 'margin', 'entropy', 'random'
             },
-            'ctdbnn_config': {
-                'resol': dataset_info.get('recommended_resolution', 100),
-                'use_complex_tensor': True,
-                'orthogonalize_weights': True,
-                'parallel_processing': True,
-                'smoothing_factor': 1e-8,
+
+            # Data Preprocessing Parameters
+            'preprocessing': {
+                'normalization': 'standard',  # 'standard', 'minmax', 'robust', 'none'
+                'handle_missing': 'mean',  # 'mean', 'median', 'mode', 'drop'
+                'categorical_encoding': 'label',  # 'label', 'onehot', 'target'
+                'feature_scaling': True,
+                'remove_outliers': False,
+                'outlier_threshold': 3.0,
+                'feature_selection': 'all',  # 'all', 'kbest', 'variance'
+                'variance_threshold': 0.0,
             }
         }
 
@@ -402,7 +447,7 @@ class UCIDatasetHandler:
         try:
             with open(config_file, 'w') as f:
                 json.dump(config, f, indent=4)
-            print(f"✅ Created configuration file: {config_file}")
+            print(f"✅ Created comprehensive configuration file: {config_file}")
             return True
         except Exception as e:
             print(f"❌ Failed to create configuration file: {e}")
@@ -737,57 +782,56 @@ class OptimizedCTDBNNWrapper:
 
     def load_data(self, file_path: str = None):
         """Load data from file with robust preprocessing - with UCI auto-download"""
-        try:
-            # Use the instance's dataset_name
-            dataset_name = getattr(self, 'dataset_name', 'unknown')
+        # Use the instance's dataset_name, not from some other object
+        dataset_name = getattr(self, 'dataset_name', 'unknown')
 
-            if file_path is None:
-                # Try to find dataset file - prioritize original data files
-                possible_files = [
-                    f"{dataset_name}.csv",
-                    f"{dataset_name}.data",
-                    f"{dataset_name}.txt",
-                    "data.csv",
-                    "train.csv"
-                ]
+        if file_path is None:
+            # Try to find dataset file - prioritize original data files
+            possible_files = [
+                f"{dataset_name}.csv",
+                f"{dataset_name}.data",
+                f"{dataset_name}.txt",
+                "data.csv",
+                "train.csv"
+            ]
 
-                for file in possible_files:
-                    if os.path.exists(file):
-                        file_path = file
-                        print(f"📁 Found data file: {file_path}")
-                        break
+            for file in possible_files:
+                if os.path.exists(file):
+                    file_path = file
+                    print(f"📁 Found data file: {file_path}")
+                    break
 
-            if file_path is None:
-                # Check if this is a known UCI dataset
-                available_uci = UCIDatasetHandler.get_available_uci_datasets()
-                if dataset_name and dataset_name.lower() in available_uci:
-                    print(f"🎯 Detected UCI dataset: {dataset_name}")
-                    # Setup UCI dataset (download + create config)
-                    success = UCIDatasetHandler.setup_uci_dataset(dataset_name)
-                    if success:
-                        file_path = f"{dataset_name}.csv"
-                        print(f"✅ UCI dataset setup complete: {file_path}")
-                    else:
-                        raise ValueError(f"Failed to setup UCI dataset: {dataset_name}")
+        if file_path is None:
+            # Check if this is a known UCI dataset
+            available_uci = UCIDatasetHandler.get_available_uci_datasets()
+            if dataset_name and dataset_name.lower() in available_uci:
+                print(f"🎯 Detected UCI dataset: {dataset_name}")
+                # Setup UCI dataset (download + create config)
+                success = UCIDatasetHandler.setup_uci_dataset(dataset_name)
+                if success:
+                    file_path = f"{dataset_name}.csv"
                 else:
-                    # Try to find any CSV or DAT file in current directory
-                    csv_files = glob.glob("*.csv")
-                    dat_files = glob.glob("*.dat")
-                    txt_files = glob.glob("*.txt")
-                    all_files = csv_files + dat_files + txt_files
+                    raise ValueError(f"Failed to setup UCI dataset: {dataset_name}")
+            else:
+                # Try to find any CSV or DAT file in current directory
+                csv_files = glob.glob("*.csv")
+                dat_files = glob.glob("*.dat")
+                txt_files = glob.glob("*.txt")
+                all_files = csv_files + dat_files + txt_files
 
-                    if all_files:
-                        file_path = all_files[0]
-                        print(f"📁 Auto-selected data file: {file_path}")
-                    else:
-                        # Show available UCI datasets
-                        available_uci = UCIDatasetHandler.get_available_uci_datasets()
-                        print(f"❌ No data file found for dataset: {dataset_name}")
-                        print(f"📋 Available UCI datasets: {', '.join(available_uci)}")
-                        print("💡 You can use one of these UCI datasets or provide your own data file")
-                        raise ValueError("No data file found. Please provide a CSV or DAT file.")
+                if all_files:
+                    file_path = all_files[0]
+                    print(f"📁 Auto-selected data file: {file_path}")
+                else:
+                    # Show available UCI datasets
+                    available_uci = UCIDatasetHandler.get_available_uci_datasets()
+                    print(f"❌ No data file found for dataset: {dataset_name}")
+                    print(f"📋 Available UCI datasets: {', '.join(available_uci)}")
+                    print("💡 You can use one of these UCI datasets or provide your own data file")
+                    raise ValueError("No data file found. Please provide a CSV or DAT file.")
 
-            # Load the data file with better error handling
+        # Load the data file with better error handling
+        try:
             if file_path.endswith('.csv'):
                 self.data = pd.read_csv(file_path)
                 print(f"✅ Loaded CSV data: {self.data.shape[0]} samples, {self.data.shape[1]} columns")
@@ -822,17 +866,10 @@ class OptimizedCTDBNNWrapper:
                 print(f"🎯 Auto-detected target column: '{self.target_column}'")
 
             print(f"📊 Available columns: {list(self.data.columns)}")
-
-            # Check if we have data
-            if self.data is None or len(self.data) == 0:
-                raise ValueError("No data loaded or empty dataset")
-
             return self.data
 
         except Exception as e:
             print(f"❌ Error loading data file: {e}")
-            import traceback
-            traceback.print_exc()
             raise
 
     def preprocess_data(self) -> Tuple[np.ndarray, np.ndarray, List[str]]:
@@ -840,25 +877,7 @@ class OptimizedCTDBNNWrapper:
         if self.data is None:
             raise ValueError("No data loaded. Call load_data() first.")
 
-        try:
-            print("🔧 Starting data preprocessing...")
-            X_processed, y_processed, feature_names = self.preprocessor.preprocess_dataset(self.data)
-
-            # Store feature names for later use
-            self.feature_names = feature_names
-
-            print(f"✅ Preprocessing completed:")
-            print(f"   📊 Processed samples: {X_processed.shape[0]}")
-            print(f"   🔧 Processed features: {X_processed.shape[1]}")
-            print(f"   🎯 Classes: {np.unique(y_processed)}")
-
-            return X_processed, y_processed, feature_names
-
-        except Exception as e:
-            print(f"❌ Error during preprocessing: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
+        return self.preprocessor.preprocess_dataset(self.data)
 
     def initialize_with_full_data(self, X: np.ndarray, y: np.ndarray):
         """Step 1: Initialize CT-DBNN architecture with full dataset - NO TRAINING"""
@@ -1108,15 +1127,19 @@ class AdaptiveCTDBNN:
         os.makedirs('adaptive_visualizations', exist_ok=True)
 
     def load_and_preprocess_data(self, file_path: str = None) -> bool:
-        """Load and preprocess data"""
+        """Load and preprocess data with better file path handling"""
         try:
             print("📥 Loading and preprocessing data...")
 
-            # Load data using the model's method
+            # Store file path for later use if provided
             if file_path:
-                self.model.load_data(file_path)
+                self.data_file_path = file_path
+
+            # Load data using the model's method with the file path
+            if hasattr(self, 'data_file_path') and self.data_file_path:
+                self.model.load_data(self.data_file_path)
             else:
-                self.model.load_data()
+                self.model.load_data(file_path)
 
             # Preprocess data using the enhanced preprocessor
             X, y, feature_names = self.model.preprocess_data()
@@ -1133,7 +1156,6 @@ class AdaptiveCTDBNN:
             print(f"   📊 Total samples: {X.shape[0]}")
             print(f"   🔧 Features: {X.shape[1]}")
             print(f"   🎯 Classes: {len(np.unique(y))}")
-            print(f"   📋 Class distribution: {np.unique(y, return_counts=True)}")
 
             return True
 
@@ -1150,215 +1172,203 @@ class AdaptiveCTDBNN:
 
         print("🏗️ Initializing CT-DBNN architecture...")
 
-        # Ensure we have the latest configuration
-        if hasattr(self.model, 'core') and hasattr(self.model.core, 'config'):
-            # Update core resolution from configuration
-            if 'resol' in self.config:
-                self.model.core.config['resol'] = self.config['resol']
-                if hasattr(self.model.core, 'resol'):
-                    self.model.core.resol = self.config['resol']
-            print(f"🔧 Using resolution: {self.model.core.config.get('resol', 'default')}")
-
         # Initialize with full data (architecture only, no training)
         self.model.initialize_with_full_data(self.X_full, self.y_full)
 
         print("✅ Architecture initialization complete")
 
     def adaptive_learn(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-            """Main adaptive learning method"""
-            print("\n🚀 STARTING ADAPTIVE LEARNING WITH CT-DBNN")
-            print("=" * 60)
+        """Main adaptive learning method"""
+        print("\n🚀 STARTING ADAPTIVE LEARNING WITH CT-DBNN")
+        print("=" * 60)
 
-            # Prepare data if not already done
-            if self.X_full is None:
-                print("📥 Data not loaded yet, loading and preprocessing...")
-                if not self.load_and_preprocess_data():
-                    print("❌ Failed to load and preprocess data")
-                    raise ValueError("Failed to load and preprocess data")
+        # Prepare data if not already done
+        if self.X_full is None:
+            if not self.load_and_preprocess_data():
+                raise ValueError("Failed to load and preprocess data")
 
-            X, y = self.X_full, self.y_full
+        X, y = self.X_full, self.y_full
 
-            print(f"📦 Total samples: {len(X)}")
-            print(f"🎯 Classes: {np.unique(y)}")
-            print(f"🔧 Features: {X.shape[1]}")
+        print(f"📦 Total samples: {len(X)}")
+        print(f"🎯 Classes: {np.unique(y)}")
 
-            # STEP 1: Initialize CT-DBNN architecture with full dataset
-            self.initialize_architecture()
+        # STEP 1: Initialize CT-DBNN architecture with full dataset
+        self.initialize_architecture()
 
-            # STEP 2: Select initial diverse training samples
-            X_train, y_train, initial_indices = self._select_initial_training_samples(X, y)
-            remaining_indices = [i for i in range(len(X)) if i not in initial_indices]
+        # STEP 2: Select initial diverse training samples
+        X_train, y_train, initial_indices = self._select_initial_training_samples(X, y)
+        remaining_indices = [i for i in range(len(X)) if i not in initial_indices]
 
-            print(f"📊 Initial training set: {len(X_train)} samples")
-            print(f"📊 Remaining test set: {len(remaining_indices)} samples")
+        print(f"📊 Initial training set: {len(X_train)} samples")
+        print(f"📊 Remaining test set: {len(remaining_indices)} samples")
 
-            # Initialize tracking variables for acid test-based stopping
-            self.best_accuracy = 0.0
-            self.best_training_indices = initial_indices.copy()
-            self.best_round = 0
-            acid_test_history = []
-            patience_counter = 0
+        # Initialize tracking variables for acid test-based stopping
+        self.best_accuracy = 0.0
+        self.best_training_indices = initial_indices.copy()
+        self.best_round = 0
+        acid_test_history = []
+        patience_counter = 0
 
-            max_rounds = self.adaptive_config['max_adaptive_rounds']
-            patience = self.adaptive_config['patience']
-            min_improvement = self.adaptive_config['min_improvement']
+        max_rounds = self.adaptive_config['max_adaptive_rounds']
+        patience = self.adaptive_config['patience']
+        min_improvement = self.adaptive_config['min_improvement']
 
-            print(f"\n🔄 Starting adaptive learning for up to {max_rounds} rounds...")
-            self.adaptive_start_time = datetime.now()
+        print(f"\n🔄 Starting adaptive learning for up to {max_rounds} rounds...")
+        self.adaptive_start_time = datetime.now()
 
-            for round_num in range(1, max_rounds + 1):
-                self.adaptive_round = round_num
+        for round_num in range(1, max_rounds + 1):
+            self.adaptive_round = round_num
 
-                print(f"\n🎯 Round {round_num}/{max_rounds}")
-                print("-" * 40)
+            print(f"\n🎯 Round {round_num}/{max_rounds}")
+            print("-" * 40)
 
-                # STEP 2 (continued): Train with current training data
-                print("🎯 Training with current training data...")
-                success = self.model.train_with_data(X_train, y_train, reset_weights=True)
+            # STEP 2 (continued): Train with current training data
+            print("🎯 Training with current training data...")
+            success = self.model.train_with_data(X_train, y_train, reset_weights=True)
 
-                if not success:
-                    print("❌ Training failed, stopping...")
-                    break
+            if not success:
+                print("❌ Training failed, stopping...")
+                break
 
-                # STEP 3: Run acid test on ENTIRE dataset - MAIN STOPPING CRITERION
-                print("🧪 Running acid test on ENTIRE dataset...")
-                try:
-                    all_predictions = self.model.predict(X)
-                    # Ensure predictions and y have same data type
-                    all_predictions = all_predictions.astype(y.dtype)
-                    acid_test_accuracy = accuracy_score(y, all_predictions)
-                    acid_test_history.append(acid_test_accuracy)
-                    print(f"📊 Acid test accuracy (entire dataset): {acid_test_accuracy:.4f}")
+            # STEP 3: Run acid test on ENTIRE dataset - MAIN STOPPING CRITERION
+            print("🧪 Running acid test on ENTIRE dataset...")
+            try:
+                all_predictions = self.model.predict(X)
+                # Ensure predictions and y have same data type
+                all_predictions = all_predictions.astype(y.dtype)
+                acid_test_accuracy = accuracy_score(y, all_predictions)
+                acid_test_history.append(acid_test_accuracy)
+                print(f"📊 Acid test accuracy (entire dataset): {acid_test_accuracy:.4f}")
 
-                    # PRIMARY STOPPING CRITERION 1: 100% accuracy on ENTIRE dataset
-                    if acid_test_accuracy >= 0.9999:  # 99.99% accuracy (accounting for floating point)
-                        print("🎉 REACHED 100% ACCURACY ON ENTIRE DATASET! Stopping adaptive learning.")
-                        self.best_accuracy = acid_test_accuracy
-                        self.best_training_indices = initial_indices.copy()
-                        self.best_round = round_num
-                        break
-
-                except Exception as e:
-                    print(f"❌ Acid test failed: {e}")
-                    acid_test_accuracy = 0.0
-                    acid_test_history.append(0.0)
-                    # Continue with the round even if acid test fails
-
-                # STEP 4: Check if we have any remaining samples to process
-                if not remaining_indices:
-                    print("💤 No more samples to add to training set")
-                    # PRIMARY STOPPING CRITERION 2: No more samples to add
-                    print("🎉 EXHAUSTED ALL SAMPLES! Stopping adaptive learning.")
-                    if acid_test_accuracy > self.best_accuracy:
-                        self.best_accuracy = acid_test_accuracy
-                        self.best_training_indices = initial_indices.copy()
-                        self.best_round = round_num
-                    break
-
-                # STEP 5: Identify failed candidates in remaining data
-                X_remaining = X[remaining_indices]
-                y_remaining = y[remaining_indices]
-
-                # Get predictions for remaining data
-                remaining_predictions = self.model.predict(X_remaining)
-                remaining_posteriors = self.model._compute_batch_posterior(X_remaining)
-
-                # Find misclassified samples
-                misclassified_mask = remaining_predictions != y_remaining
-                misclassified_indices = np.where(misclassified_mask)[0]
-
-                if len(misclassified_indices) == 0:
-                    print("✅ No misclassified samples in remaining data!")
-                    # This means we have perfect classification on remaining data
-                    print("📊 Perfect on remaining data, continuing to monitor acid test...")
-                else:
-                    print(f"📊 Found {len(misclassified_indices)} misclassified samples in remaining data")
-
-                    # STEP 6: Select most divergent failed candidates
-                    samples_to_add_indices = self._select_divergent_samples(
-                        X_remaining, y_remaining, remaining_predictions, remaining_posteriors,
-                        misclassified_indices, remaining_indices
-                    )
-
-                    if samples_to_add_indices:
-                        # Update training set
-                        initial_indices.extend(samples_to_add_indices)
-                        remaining_indices = [i for i in remaining_indices if i not in samples_to_add_indices]
-
-                        X_train = X[initial_indices]
-                        y_train = y[initial_indices]
-
-                        print(f"📈 Training set size: {len(X_train)} samples ({len(X_train)/len(X)*100:.1f}% of total)")
-                        print(f"📊 Remaining set size: {len(remaining_indices)} samples")
-                    else:
-                        print("💤 No divergent samples to add in this round")
-
-                # STEP 7: Update best model and check for improvement
-                if acid_test_accuracy > self.best_accuracy + min_improvement:
-                    improvement = acid_test_accuracy - self.best_accuracy
+                # PRIMARY STOPPING CRITERION 1: 100% accuracy on ENTIRE dataset
+                if acid_test_accuracy >= 0.9999:  # 99.99% accuracy (accounting for floating point)
+                    print("🎉 REACHED 100% ACCURACY ON ENTIRE DATASET! Stopping adaptive learning.")
                     self.best_accuracy = acid_test_accuracy
                     self.best_training_indices = initial_indices.copy()
                     self.best_round = round_num
-                    patience_counter = 0
-                    print(f"🏆 New best acid test accuracy: {acid_test_accuracy:.4f} (+{improvement:.4f})")
-                else:
-                    patience_counter += 1
-                    if acid_test_accuracy > self.best_accuracy:
-                        small_improvement = acid_test_accuracy - self.best_accuracy
-                        print(f"↗️  Small improvement: {acid_test_accuracy:.4f} (+{small_improvement:.4f}) - Patience: {patience_counter}/{patience}")
-                    else:
-                        print(f"🔄 No improvement - Patience: {patience_counter}/{patience}")
-
-                # PRIMARY STOPPING CRITERION 3: No significant improvement for patience rounds
-                if patience_counter >= patience:
-                    print(f"🛑 PATIENCE EXCEEDED: No significant improvement in acid test for {patience} rounds")
-                    print(f"   Best acid test accuracy: {self.best_accuracy:.4f} (round {self.best_round})")
-                    print(f"   Current acid test accuracy: {acid_test_accuracy:.4f}")
                     break
 
-                # PRIMARY STOPPING CRITERION 4: Maximum rounds reached
-                if round_num >= max_rounds:
-                    print(f"🛑 MAXIMUM ROUNDS REACHED: Completed {max_rounds} rounds")
-                    break
+            except Exception as e:
+                print(f"❌ Acid test failed: {e}")
+                acid_test_accuracy = 0.0
+                acid_test_history.append(0.0)
+                # Continue with the round even if acid test fails
 
-            # Finalize with best configuration
-            print(f"\n🎉 Adaptive learning completed after {self.adaptive_round} rounds!")
+            # STEP 4: Check if we have any remaining samples to process
+            if not remaining_indices:
+                print("💤 No more samples to add to training set")
+                # PRIMARY STOPPING CRITERION 2: No more samples to add
+                print("🎉 EXHAUSTED ALL SAMPLES! Stopping adaptive learning.")
+                if acid_test_accuracy > self.best_accuracy:
+                    self.best_accuracy = acid_test_accuracy
+                    self.best_training_indices = initial_indices.copy()
+                    self.best_round = round_num
+                break
 
-            # Ensure we have valid best values
-            if not hasattr(self, 'best_accuracy') or self.best_accuracy == 0.0:
-                # Use final values if best wasn't set
-                self.best_accuracy = acid_test_history[-1] if acid_test_history else 0.0
-                self.best_training_indices = initial_indices.copy()
-                self.best_round = self.adaptive_round
+            # STEP 5: Identify failed candidates in remaining data
+            X_remaining = X[remaining_indices]
+            y_remaining = y[remaining_indices]
 
-            print(f"🏆 Best acid test accuracy: {self.best_accuracy:.4f} (round {self.best_round})")
-            print(f"📊 Final training set: {len(self.best_training_indices)} samples ({len(self.best_training_indices)/len(X)*100:.1f}% of total)")
+            # Get predictions for remaining data
+            remaining_predictions = self.model.predict(X_remaining)
+            remaining_posteriors = self.model._compute_batch_posterior(X_remaining)
 
-            # Use best configuration for final model
-            X_train_best = X[self.best_training_indices]
-            y_train_best = y[self.best_training_indices]
-            X_test_best = X[[i for i in range(len(X)) if i not in self.best_training_indices]]
-            y_test_best = y[[i for i in range(len(X)) if i not in self.best_training_indices]]
+            # Find misclassified samples
+            misclassified_mask = remaining_predictions != y_remaining
+            misclassified_indices = np.where(misclassified_mask)[0]
 
-            # Train final model with best configuration
-            print("🔧 Training final model with best configuration...")
-            self.model.train_with_data(X_train_best, y_train_best, reset_weights=True)
+            if len(misclassified_indices) == 0:
+                print("✅ No misclassified samples in remaining data!")
+                # This means we have perfect classification on remaining data
+                print("📊 Perfect on remaining data, continuing to monitor acid test...")
+            else:
+                print(f"📊 Found {len(misclassified_indices)} misclassified samples in remaining data")
 
-            # Final acid test verification
-            final_predictions = self.model.predict(X)
-            final_accuracy = accuracy_score(y, final_predictions)
-
-            print(f"📊 Final acid test accuracy: {final_accuracy:.4f}")
-            print(f"📈 Final training set size: {len(X_train_best)}")
-            print(f"📊 Final remaining set size: {len(X_test_best)}")
-
-            # Create visualizations
-            if self.adaptive_visualizer:
-                self.adaptive_visualizer.create_visualizations(
-                    X, y, final_predictions
+                # STEP 6: Select most divergent failed candidates
+                samples_to_add_indices = self._select_divergent_samples(
+                    X_remaining, y_remaining, remaining_predictions, remaining_posteriors,
+                    misclassified_indices, remaining_indices
                 )
 
-            return X_train_best, y_train_best, X_test_best, y_test_best
+                if samples_to_add_indices:
+                    # Update training set
+                    initial_indices.extend(samples_to_add_indices)
+                    remaining_indices = [i for i in remaining_indices if i not in samples_to_add_indices]
+
+                    X_train = X[initial_indices]
+                    y_train = y[initial_indices]
+
+                    print(f"📈 Training set size: {len(X_train)} samples ({len(X_train)/len(X)*100:.1f}% of total)")
+                    print(f"📊 Remaining set size: {len(remaining_indices)} samples")
+                else:
+                    print("💤 No divergent samples to add in this round")
+
+            # STEP 7: Update best model and check for improvement
+            if acid_test_accuracy > self.best_accuracy + min_improvement:
+                improvement = acid_test_accuracy - self.best_accuracy
+                self.best_accuracy = acid_test_accuracy
+                self.best_training_indices = initial_indices.copy()
+                self.best_round = round_num
+                patience_counter = 0
+                print(f"🏆 New best acid test accuracy: {acid_test_accuracy:.4f} (+{improvement:.4f})")
+            else:
+                patience_counter += 1
+                if acid_test_accuracy > self.best_accuracy:
+                    small_improvement = acid_test_accuracy - self.best_accuracy
+                    print(f"↗️  Small improvement: {acid_test_accuracy:.4f} (+{small_improvement:.4f}) - Patience: {patience_counter}/{patience}")
+                else:
+                    print(f"🔄 No improvement - Patience: {patience_counter}/{patience}")
+
+            # PRIMARY STOPPING CRITERION 3: No significant improvement for patience rounds
+            if patience_counter >= patience:
+                print(f"🛑 PATIENCE EXCEEDED: No significant improvement in acid test for {patience} rounds")
+                print(f"   Best acid test accuracy: {self.best_accuracy:.4f} (round {self.best_round})")
+                print(f"   Current acid test accuracy: {acid_test_accuracy:.4f}")
+                break
+
+            # PRIMARY STOPPING CRITERION 4: Maximum rounds reached
+            if round_num >= max_rounds:
+                print(f"🛑 MAXIMUM ROUNDS REACHED: Completed {max_rounds} rounds")
+                break
+
+        # Finalize with best configuration
+        print(f"\n🎉 Adaptive learning completed after {self.adaptive_round} rounds!")
+
+        # Ensure we have valid best values
+        if not hasattr(self, 'best_accuracy') or self.best_accuracy == 0.0:
+            # Use final values if best wasn't set
+            self.best_accuracy = acid_test_history[-1] if acid_test_history else 0.0
+            self.best_training_indices = initial_indices.copy()
+            self.best_round = self.adaptive_round
+
+        print(f"🏆 Best acid test accuracy: {self.best_accuracy:.4f} (round {self.best_round})")
+        print(f"📊 Final training set: {len(self.best_training_indices)} samples ({len(self.best_training_indices)/len(X)*100:.1f}% of total)")
+
+        # Use best configuration for final model
+        X_train_best = X[self.best_training_indices]
+        y_train_best = y[self.best_training_indices]
+        X_test_best = X[[i for i in range(len(X)) if i not in self.best_training_indices]]
+        y_test_best = y[[i for i in range(len(X)) if i not in self.best_training_indices]]
+
+        # Train final model with best configuration
+        print("🔧 Training final model with best configuration...")
+        self.model.train_with_data(X_train_best, y_train_best, reset_weights=True)
+
+        # Final acid test verification
+        final_predictions = self.model.predict(X)
+        final_accuracy = accuracy_score(y, final_predictions)
+
+        print(f"📊 Final acid test accuracy: {final_accuracy:.4f}")
+        print(f"📈 Final training set size: {len(X_train_best)}")
+        print(f"📊 Final remaining set size: {len(X_test_best)}")
+
+        # Create visualizations
+        if self.adaptive_visualizer:
+            self.adaptive_visualizer.create_visualizations(
+                X, y, final_predictions
+            )
+
+        return X_train_best, y_train_best, X_test_best, y_test_best
 
     def _select_initial_training_samples(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, List[int]]:
         """Select initial diverse training samples from each class"""
@@ -1474,8 +1484,350 @@ class AdaptiveCTDBNNGUI:
 
         self.setup_gui()
 
+    def load_default_parameters(self):
+        """Load default hyperparameters for the current dataset"""
+        if not hasattr(self, 'adaptive_model') or self.adaptive_model is None:
+            messagebox.showwarning("Warning", "Please load a dataset first.")
+            return
+
+        try:
+            dataset_name = self.dataset_var.get()
+            config = DatasetConfig.load_config(dataset_name)
+
+            if config:
+                # CT-DBNN parameters
+                ctdbnn_config = config.get('ctdbnn_config', {})
+                self.resolution_var.set(str(ctdbnn_config.get('resol', 100)))
+                self.learning_rate_var.set(str(ctdbnn_config.get('learning_rate', 0.01)))
+                self.max_epochs_var.set(str(ctdbnn_config.get('max_epochs', 100)))
+                self.batch_size_var.set(str(ctdbnn_config.get('batch_size', 32)))
+                self.smoothing_factor_var.set(str(ctdbnn_config.get('smoothing_factor', '1e-8')))
+                self.use_complex_var.set(ctdbnn_config.get('use_complex_tensor', True))
+                self.orthogonalize_var.set(ctdbnn_config.get('orthogonalize_weights', True))
+                self.parallel_var.set(ctdbnn_config.get('parallel_processing', True))
+
+                # Adaptive learning parameters
+                adaptive_config = config.get('adaptive_learning', {})
+                self.initial_samples_var.set(str(adaptive_config.get('initial_samples_per_class', 5)))
+                self.max_rounds_var.set(str(adaptive_config.get('max_adaptive_rounds', 20)))
+                self.patience_var.set(str(adaptive_config.get('patience', 10)))
+                self.min_improvement_var.set(str(adaptive_config.get('min_improvement', 0.001)))
+                self.enable_acid_var.set(adaptive_config.get('enable_acid_test', True))
+                self.class_balance_var.set(adaptive_config.get('class_balancing', True))
+                self.hard_mining_var.set(adaptive_config.get('hard_sample_mining', True))
+                self.divergence_threshold_var.set(str(adaptive_config.get('divergence_threshold', 0.1)))
+                self.max_samples_round_var.set(str(adaptive_config.get('max_samples_per_round', 5)))
+                self.selection_strategy_var.set(adaptive_config.get('sample_selection_strategy', 'margin'))
+
+                # Preprocessing parameters
+                preprocessing_config = config.get('preprocessing', {})
+                self.normalization_var.set(preprocessing_config.get('normalization', 'standard'))
+                self.missing_values_var.set(preprocessing_config.get('handle_missing', 'mean'))
+                self.encoding_var.set(preprocessing_config.get('categorical_encoding', 'label'))
+                self.remove_outliers_var.set(preprocessing_config.get('remove_outliers', False))
+                self.feature_scaling_var.set(preprocessing_config.get('feature_scaling', True))
+
+                self.log_output("✅ Loaded default parameters from configuration")
+            else:
+                self.log_output("⚠️ No configuration found, using built-in defaults")
+
+        except Exception as e:
+            self.log_output(f"❌ Error loading default parameters: {e}")
+
+    def save_current_parameters(self):
+        """Save current hyperparameters to configuration file"""
+        if not hasattr(self, 'adaptive_model') or self.adaptive_model is None:
+            messagebox.showwarning("Warning", "Please load a dataset first.")
+            return
+
+        try:
+            dataset_name = self.dataset_var.get()
+            config = {
+                'dataset_name': dataset_name,
+                'target_column': self.target_var.get(),
+
+                'ctdbnn_config': {
+                    'resol': int(self.resolution_var.get()),
+                    'learning_rate': float(self.learning_rate_var.get()),
+                    'max_epochs': int(self.max_epochs_var.get()),
+                    'batch_size': int(self.batch_size_var.get()),
+                    'smoothing_factor': float(self.smoothing_factor_var.get()),
+                    'use_complex_tensor': self.use_complex_var.get(),
+                    'orthogonalize_weights': self.orthogonalize_var.get(),
+                    'parallel_processing': self.parallel_var.get(),
+                },
+
+                'adaptive_learning': {
+                    'initial_samples_per_class': int(self.initial_samples_var.get()),
+                    'max_adaptive_rounds': int(self.max_rounds_var.get()),
+                    'patience': int(self.patience_var.get()),
+                    'min_improvement': float(self.min_improvement_var.get()),
+                    'enable_acid_test': self.enable_acid_var.get(),
+                    'class_balancing': self.class_balance_var.get(),
+                    'hard_sample_mining': self.hard_mining_var.get(),
+                    'divergence_threshold': float(self.divergence_threshold_var.get()),
+                    'max_samples_per_round': int(self.max_samples_round_var.get()),
+                    'sample_selection_strategy': self.selection_strategy_var.get(),
+                },
+
+                'preprocessing': {
+                    'normalization': self.normalization_var.get(),
+                    'handle_missing': self.missing_values_var.get(),
+                    'categorical_encoding': self.encoding_var.get(),
+                    'remove_outliers': self.remove_outliers_var.get(),
+                    'feature_scaling': self.feature_scaling_var.get(),
+                }
+            }
+
+            config_file = f"{dataset_name}.conf"
+            with open(config_file, 'w') as f:
+                json.dump(config, f, indent=4)
+
+            self.log_output(f"✅ Saved current parameters to {config_file}")
+
+        except Exception as e:
+            self.log_output(f"❌ Error saving parameters: {e}")
+
+    def reset_to_dataset_defaults(self):
+        """Reset parameters to dataset-specific defaults"""
+        if not hasattr(self, 'adaptive_model') or self.adaptive_model is None:
+            messagebox.showwarning("Warning", "Please load a dataset first.")
+            return
+
+        try:
+            dataset_name = self.dataset_var.get()
+            dataset_info = UCIDatasetHandler.get_dataset_info(dataset_name)
+
+            if dataset_info:
+                recommended_resol = dataset_info.get('recommended_resolution', 100)
+                self.resolution_var.set(str(recommended_resol))
+                self.log_output(f"✅ Reset resolution to dataset default: {recommended_resol}")
+            else:
+                self.log_output("⚠️ No dataset-specific defaults found")
+
+        except Exception as e:
+            self.log_output(f"❌ Error resetting to dataset defaults: {e}")
+
+    def apply_hyperparameters(self):
+        """Apply current hyperparameters to the model"""
+        if not hasattr(self, 'adaptive_model') or self.adaptive_model is None:
+            messagebox.showwarning("Warning", "Please load a dataset first.")
+            return
+
+        try:
+            # Update CT-DBNN configuration
+            self.adaptive_model.config.update({
+                'resol': int(self.resolution_var.get()),
+                'target_column': self.target_var.get(),
+            })
+
+            # Update CT-DBNN core configuration
+            self.adaptive_model.config['ctdbnn_config'] = {
+                'resol': int(self.resolution_var.get()),
+                'learning_rate': float(self.learning_rate_var.get()),
+                'max_epochs': int(self.max_epochs_var.get()),
+                'batch_size': int(self.batch_size_var.get()),
+                'smoothing_factor': float(self.smoothing_factor_var.get()),
+                'use_complex_tensor': self.use_complex_var.get(),
+                'orthogonalize_weights': self.orthogonalize_var.get(),
+                'parallel_processing': self.parallel_var.get(),
+            }
+
+            # Update adaptive learning configuration
+            self.adaptive_model.adaptive_config.update({
+                'initial_samples_per_class': int(self.initial_samples_var.get()),
+                'max_adaptive_rounds': int(self.max_rounds_var.get()),
+                'patience': int(self.patience_var.get()),
+                'min_improvement': float(self.min_improvement_var.get()),
+                'enable_acid_test': self.enable_acid_var.get(),
+                'class_balancing': self.class_balance_var.get(),
+                'hard_sample_mining': self.hard_mining_var.get(),
+                'divergence_threshold': float(self.divergence_threshold_var.get()),
+                'max_samples_per_round': int(self.max_samples_round_var.get()),
+                'sample_selection_strategy': self.selection_strategy_var.get(),
+            })
+
+            # Update model's configuration
+            self.adaptive_model.model.config.update(self.adaptive_model.config)
+
+            self.log_output("✅ Hyperparameters applied to model")
+            self.log_output(f"   Resolution: {self.resolution_var.get()}")
+            self.log_output(f"   Learning Rate: {self.learning_rate_var.get()}")
+            self.log_output(f"   Max Rounds: {self.max_rounds_var.get()}")
+
+        except Exception as e:
+            self.log_output(f"❌ Error applying hyperparameters: {e}")
+
+
+    def setup_hyperparameters_tab(self, parent):
+        """Setup comprehensive hyperparameters configuration tab"""
+        # Create main frame with scrollbar
+        main_frame = ttk.Frame(parent)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Create canvas and scrollbar
+        canvas = tk.Canvas(main_frame)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        # Pack canvas and scrollbar
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # CT-DBNN Core Parameters Frame
+        core_frame = ttk.LabelFrame(scrollable_frame, text="CT-DBNN Core Parameters", padding="10")
+        core_frame.pack(fill=tk.X, pady=5, padx=10)
+
+        # Resolution
+        ttk.Label(core_frame, text="Resolution:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        self.resolution_var = tk.StringVar(value="100")
+        ttk.Entry(core_frame, textvariable=self.resolution_var, width=10).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Label(core_frame, text="(Grid resolution for tensor operations)").grid(row=0, column=2, sticky=tk.W, padx=5)
+
+        # Learning Rate
+        ttk.Label(core_frame, text="Learning Rate:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        self.learning_rate_var = tk.StringVar(value="0.01")
+        ttk.Entry(core_frame, textvariable=self.learning_rate_var, width=10).grid(row=1, column=1, padx=5, pady=2)
+
+        # Max Epochs
+        ttk.Label(core_frame, text="Max Epochs:").grid(row=1, column=3, sticky=tk.W, padx=5, pady=2)
+        self.max_epochs_var = tk.StringVar(value="100")
+        ttk.Entry(core_frame, textvariable=self.max_epochs_var, width=10).grid(row=1, column=4, padx=5, pady=2)
+
+        # Batch Size
+        ttk.Label(core_frame, text="Batch Size:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
+        self.batch_size_var = tk.StringVar(value="32")
+        ttk.Entry(core_frame, textvariable=self.batch_size_var, width=10).grid(row=2, column=1, padx=5, pady=2)
+
+        # Smoothing Factor
+        ttk.Label(core_frame, text="Smoothing Factor:").grid(row=2, column=3, sticky=tk.W, padx=5, pady=2)
+        self.smoothing_factor_var = tk.StringVar(value="1e-8")
+        ttk.Entry(core_frame, textvariable=self.smoothing_factor_var, width=10).grid(row=2, column=4, padx=5, pady=2)
+
+        # Advanced CT-DBNN Options
+        ttk.Label(core_frame, text="Advanced Options:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=2)
+
+        self.use_complex_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(core_frame, text="Use Complex Tensor", variable=self.use_complex_var).grid(row=3, column=1, sticky=tk.W, padx=5)
+
+        self.orthogonalize_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(core_frame, text="Orthogonalize Weights", variable=self.orthogonalize_var).grid(row=3, column=2, sticky=tk.W, padx=5)
+
+        self.parallel_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(core_frame, text="Parallel Processing", variable=self.parallel_var).grid(row=3, column=3, sticky=tk.W, padx=5)
+
+        # Adaptive Learning Parameters Frame
+        adaptive_frame = ttk.LabelFrame(scrollable_frame, text="Adaptive Learning Parameters", padding="10")
+        adaptive_frame.pack(fill=tk.X, pady=5, padx=10)
+
+        # Initial samples per class
+        ttk.Label(adaptive_frame, text="Initial Samples/Class:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        self.initial_samples_var = tk.StringVar(value="5")
+        ttk.Entry(adaptive_frame, textvariable=self.initial_samples_var, width=10).grid(row=0, column=1, padx=5, pady=2)
+
+        # Max adaptive rounds
+        ttk.Label(adaptive_frame, text="Max Adaptive Rounds:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=2)
+        self.max_rounds_var = tk.StringVar(value="20")
+        ttk.Entry(adaptive_frame, textvariable=self.max_rounds_var, width=10).grid(row=0, column=3, padx=5, pady=2)
+
+        # Patience
+        ttk.Label(adaptive_frame, text="Patience:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        self.patience_var = tk.StringVar(value="10")
+        ttk.Entry(adaptive_frame, textvariable=self.patience_var, width=10).grid(row=1, column=1, padx=5, pady=2)
+
+        # Min improvement
+        ttk.Label(adaptive_frame, text="Min Improvement:").grid(row=1, column=2, sticky=tk.W, padx=5, pady=2)
+        self.min_improvement_var = tk.StringVar(value="0.001")
+        ttk.Entry(adaptive_frame, textvariable=self.min_improvement_var, width=10).grid(row=1, column=3, padx=5, pady=2)
+
+        # Advanced Adaptive Options
+        ttk.Label(adaptive_frame, text="Advanced Adaptive:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
+
+        self.enable_acid_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(adaptive_frame, text="Enable Acid Test", variable=self.enable_acid_var).grid(row=2, column=1, sticky=tk.W, padx=5)
+
+        self.class_balance_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(adaptive_frame, text="Class Balancing", variable=self.class_balance_var).grid(row=2, column=2, sticky=tk.W, padx=5)
+
+        self.hard_mining_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(adaptive_frame, text="Hard Sample Mining", variable=self.hard_mining_var).grid(row=2, column=3, sticky=tk.W, padx=5)
+
+        # Divergence threshold
+        ttk.Label(adaptive_frame, text="Divergence Threshold:").grid(row=3, column=0, sticky=tk.W, padx=5, pady=2)
+        self.divergence_threshold_var = tk.StringVar(value="0.1")
+        ttk.Entry(adaptive_frame, textvariable=self.divergence_threshold_var, width=10).grid(row=3, column=1, padx=5, pady=2)
+
+        # Max samples per round
+        ttk.Label(adaptive_frame, text="Max Samples/Round:").grid(row=3, column=2, sticky=tk.W, padx=5, pady=2)
+        self.max_samples_round_var = tk.StringVar(value="5")
+        ttk.Entry(adaptive_frame, textvariable=self.max_samples_round_var, width=10).grid(row=3, column=3, padx=5, pady=2)
+
+        # Sample selection strategy
+        ttk.Label(adaptive_frame, text="Selection Strategy:").grid(row=4, column=0, sticky=tk.W, padx=5, pady=2)
+        self.selection_strategy_var = tk.StringVar(value="margin")
+        strategy_combo = ttk.Combobox(adaptive_frame, textvariable=self.selection_strategy_var,
+                                     values=["margin", "entropy", "random"], width=10)
+        strategy_combo.grid(row=4, column=1, padx=5, pady=2)
+
+        # Preprocessing Parameters Frame
+        preprocessing_frame = ttk.LabelFrame(scrollable_frame, text="Data Preprocessing Parameters", padding="10")
+        preprocessing_frame.pack(fill=tk.X, pady=5, padx=10)
+
+        # Normalization
+        ttk.Label(preprocessing_frame, text="Normalization:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
+        self.normalization_var = tk.StringVar(value="standard")
+        norm_combo = ttk.Combobox(preprocessing_frame, textvariable=self.normalization_var,
+                                 values=["standard", "minmax", "robust", "none"], width=10)
+        norm_combo.grid(row=0, column=1, padx=5, pady=2)
+
+        # Missing value handling
+        ttk.Label(preprocessing_frame, text="Missing Values:").grid(row=0, column=2, sticky=tk.W, padx=5, pady=2)
+        self.missing_values_var = tk.StringVar(value="mean")
+        missing_combo = ttk.Combobox(preprocessing_frame, textvariable=self.missing_values_var,
+                                    values=["mean", "median", "mode", "drop"], width=10)
+        missing_combo.grid(row=0, column=3, padx=5, pady=2)
+
+        # Categorical encoding
+        ttk.Label(preprocessing_frame, text="Categorical Encoding:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
+        self.encoding_var = tk.StringVar(value="label")
+        encoding_combo = ttk.Combobox(preprocessing_frame, textvariable=self.encoding_var,
+                                     values=["label", "onehot", "target"], width=10)
+        encoding_combo.grid(row=1, column=1, padx=5, pady=2)
+
+        # Advanced preprocessing options
+        self.remove_outliers_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(preprocessing_frame, text="Remove Outliers", variable=self.remove_outliers_var).grid(row=1, column=2, sticky=tk.W, padx=5)
+
+        self.feature_scaling_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(preprocessing_frame, text="Feature Scaling", variable=self.feature_scaling_var).grid(row=1, column=3, sticky=tk.W, padx=5)
+
+        # Control buttons frame
+        button_frame = ttk.Frame(scrollable_frame)
+        button_frame.pack(fill=tk.X, pady=10, padx=10)
+
+        ttk.Button(button_frame, text="Load Default Parameters",
+                  command=self.load_default_parameters).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Save Current Parameters",
+                  command=self.save_current_parameters).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Reset to Dataset Defaults",
+                  command=self.reset_to_dataset_defaults).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Apply Parameters",
+                  command=self.apply_hyperparameters).pack(side=tk.RIGHT, padx=5)
+
+        # Configure column weights for responsive layout
+        for frame in [core_frame, adaptive_frame, preprocessing_frame]:
+            frame.columnconfigure(2, weight=1)
+
     def setup_gui(self):
-        """Setup the main GUI"""
+        """Setup the main GUI with hyperparameters tab"""
         # Main frame
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -1493,6 +1845,10 @@ class AdaptiveCTDBNNGUI:
         data_tab = ttk.Frame(notebook)
         notebook.add(data_tab, text="Data Management")
 
+        # Hyperparameters Tab
+        hyperparams_tab = ttk.Frame(notebook)
+        notebook.add(hyperparams_tab, text="Hyperparameters")
+
         # Training Tab
         training_tab = ttk.Frame(notebook)
         notebook.add(training_tab, text="Training & Evaluation")
@@ -1503,6 +1859,7 @@ class AdaptiveCTDBNNGUI:
 
         # Setup each tab
         self.setup_data_tab(data_tab)
+        self.setup_hyperparameters_tab(hyperparams_tab)
         self.setup_training_tab(training_tab)
         self.setup_visualization_tab(viz_tab)
 
@@ -1592,37 +1949,32 @@ class AdaptiveCTDBNNGUI:
         feature_frame.rowconfigure(1, weight=1)
 
     def setup_training_tab(self, parent):
-        """Setup training and evaluation tab"""
-        # Configuration frame
-        config_frame = ttk.LabelFrame(parent, text="Training Configuration", padding="10")
-        config_frame.pack(fill=tk.X, pady=5)
+        """Setup training and evaluation tab with new functionality"""
+        # Control buttons frame - Top row
+        control_frame1 = ttk.Frame(parent)
+        control_frame1.pack(fill=tk.X, pady=5)
 
-        # Resolution setting
-        ttk.Label(config_frame, text="Resolution:").grid(row=0, column=0, sticky=tk.W, padx=5)
-        self.resolution_var = tk.StringVar(value="100")
-        ttk.Entry(config_frame, textvariable=self.resolution_var, width=10).grid(row=0, column=1, padx=5)
+        ttk.Button(control_frame1, text="Initialize Model",
+                  command=self.initialize_model, width=15).pack(side=tk.LEFT, padx=2)
+        ttk.Button(control_frame1, text="Run Adaptive Learning",
+                  command=self.run_adaptive_learning, width=18).pack(side=tk.LEFT, padx=2)
+        ttk.Button(control_frame1, text="Evaluate Model",
+                  command=self.evaluate_model, width=15).pack(side=tk.LEFT, padx=2)
+        ttk.Button(control_frame1, text="Make Predictions",
+                  command=self.make_predictions, width=15).pack(side=tk.LEFT, padx=2)
 
-        # Adaptive learning settings
-        ttk.Label(config_frame, text="Initial Samples/Class:").grid(row=0, column=2, sticky=tk.W, padx=5)
-        self.initial_samples_var = tk.StringVar(value="5")
-        ttk.Entry(config_frame, textvariable=self.initial_samples_var, width=10).grid(row=0, column=3, padx=5)
+        # Control buttons frame - Bottom row (new functionality)
+        control_frame2 = ttk.Frame(parent)
+        control_frame2.pack(fill=tk.X, pady=5)
 
-        ttk.Label(config_frame, text="Max Rounds:").grid(row=1, column=0, sticky=tk.W, padx=5)
-        self.max_rounds_var = tk.StringVar(value="20")
-        ttk.Entry(config_frame, textvariable=self.max_rounds_var, width=10).grid(row=1, column=1, padx=5)
-
-        # Control buttons frame
-        control_frame = ttk.Frame(parent)
-        control_frame.pack(fill=tk.X, pady=10)
-
-        ttk.Button(control_frame, text="Initialize Model",
-                  command=self.initialize_model, width=15).pack(side=tk.LEFT, padx=5)
-        ttk.Button(control_frame, text="Run Adaptive Learning",
-                  command=self.run_adaptive_learning, width=20).pack(side=tk.LEFT, padx=5)
-        ttk.Button(control_frame, text="Evaluate Model",
-                  command=self.evaluate_model, width=15).pack(side=tk.LEFT, padx=5)
-        ttk.Button(control_frame, text="Make Predictions",
-                  command=self.make_predictions, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(control_frame2, text="Save Model",
+                  command=self.save_model, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(control_frame2, text="Load Model",
+                  command=self.load_model, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(control_frame2, text="Predict File",
+                  command=self.predict_file, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(control_frame2, text="Exit",
+                  command=self.exit_application, width=12).pack(side=tk.LEFT, padx=2)
 
         # Output frame
         output_frame = ttk.LabelFrame(parent, text="Training Output", padding="10")
@@ -1630,34 +1982,6 @@ class AdaptiveCTDBNNGUI:
 
         self.output_text = scrolledtext.ScrolledText(output_frame, height=15, width=100)
         self.output_text.pack(fill=tk.BOTH, expand=True)
-
-    def update_configuration(self):
-        """Update the model configuration with current GUI values"""
-        if not hasattr(self, 'adaptive_model') or self.adaptive_model is None:
-            return
-
-        # Update main configuration
-        self.adaptive_model.config.update({
-            'resol': int(self.resolution_var.get()),
-            'target_column': self.target_var.get(),
-        })
-
-        # Update adaptive learning configuration
-        self.adaptive_model.adaptive_config.update({
-            'initial_samples_per_class': int(self.initial_samples_var.get()),
-            'max_adaptive_rounds': int(self.max_rounds_var.get()),
-        })
-
-        # Update CT-DBNN core configuration
-        if hasattr(self.adaptive_model.model, 'core') and hasattr(self.adaptive_model.model.core, 'config'):
-            self.adaptive_model.model.core.config['resol'] = int(self.resolution_var.get())
-            if hasattr(self.adaptive_model.model.core, 'resol'):
-                self.adaptive_model.model.core.resol = int(self.resolution_var.get())
-
-        self.log_output(f"✅ Configuration updated:")
-        self.log_output(f"   🔧 Resolution: {self.resolution_var.get()}")
-        self.log_output(f"   🔄 Max Rounds: {self.max_rounds_var.get()}")
-        self.log_output(f"   📊 Initial Samples: {self.initial_samples_var.get()}")
 
     def setup_visualization_tab(self, parent):
         """Setup visualization tab"""
@@ -1722,17 +2046,20 @@ class AdaptiveCTDBNNGUI:
         self.log_output(f"✅ Loaded information for dataset: {dataset_name}")
 
     def browse_file(self):
-        """Browse for data file"""
+        """Browse for data file with better path handling"""
         file_path = filedialog.askopenfilename(
             title="Select Data File",
             filetypes=[("CSV files", "*.csv"), ("Data files", "*.data"), ("Text files", "*.txt"), ("All files", "*.*")]
         )
         if file_path:
-            self.dataset_var.set(os.path.splitext(os.path.basename(file_path))[0])
+            # Use the filename without extension as dataset name
+            dataset_name = os.path.splitext(os.path.basename(file_path))[0]
+            self.dataset_var.set(dataset_name)
+            self.log_output(f"📁 Selected file: {file_path}")
             self.load_data(file_path)
 
     def load_data(self, file_path=None):
-        """Load dataset with proper error handling"""
+        """Load dataset with proper error handling and target column synchronization"""
         dataset_name = self.dataset_var.get()
         if not dataset_name:
             messagebox.showwarning("Warning", "Please select or enter a dataset name first.")
@@ -1744,30 +2071,37 @@ class AdaptiveCTDBNNGUI:
             # Create adaptive model with the dataset name
             self.adaptive_model = AdaptiveCTDBNN(dataset_name)
 
-            # Load data - pass the dataset name to the model
+            # Load data - pass the file path properly
             if file_path:
+                # Store the file path for later use
+                self.adaptive_model.data_file_path = file_path
+                # Load data first
                 self.adaptive_model.model.load_data(file_path)
             else:
-                # Pass the dataset name explicitly to the model's load_data method
+                # Pass the dataset name explicitly to the model
                 self.adaptive_model.model.dataset_name = dataset_name
                 self.adaptive_model.model.load_data()
 
+            # NOW set the target column from GUI BEFORE preprocessing
+            if hasattr(self, 'target_var') and self.target_var.get():
+                target_column = self.target_var.get()
+                # Update ALL target column references
+                self.adaptive_model.model.target_column = target_column
+                self.adaptive_model.model.preprocessor.target_column = target_column
+                self.adaptive_model.config['target_column'] = target_column
+                self.adaptive_model.target_column = target_column
+                self.log_output(f"🎯 Target column set to: {target_column}")
+
             self.current_data = self.adaptive_model.model.data
             self.data_loaded = True
-
+            if self.data_loaded:
+                self.load_default_parameters()
+                self.log_output("📋 Auto-loaded default hyperparameters")
             # Update feature selection
             self.update_feature_selection()
 
             self.log_output(f"✅ Dataset loaded: {self.current_data.shape[0]} samples, {self.current_data.shape[1]} features")
             self.log_output(f"📊 Available columns: {list(self.current_data.columns)}")
-
-            # IMPORTANT: Update the model's target column based on GUI selection
-            if hasattr(self, 'target_var') and self.target_var.get():
-                target_column = self.target_var.get()
-                self.adaptive_model.model.target_column = target_column
-                self.adaptive_model.model.preprocessor.target_column = target_column
-                self.adaptive_model.config['target_column'] = target_column
-                self.log_output(f"🎯 Target column set to: {target_column}")
 
         except Exception as e:
             self.log_output(f"❌ Error loading dataset: {e}")
@@ -1775,7 +2109,7 @@ class AdaptiveCTDBNNGUI:
             self.log_output(f"🔍 Detailed error: {traceback.format_exc()}")
 
     def update_feature_selection(self):
-        """Update feature selection UI"""
+        """Update feature selection UI and synchronize target column"""
         if not self.data_loaded or self.current_data is None:
             return
 
@@ -1798,12 +2132,19 @@ class AdaptiveCTDBNNGUI:
             for candidate in target_candidates:
                 if candidate in columns:
                     self.target_var.set(candidate)
+                    # Immediately update the model if it exists
+                    if hasattr(self, 'adaptive_model') and self.adaptive_model is not None:
+                        self.adaptive_model.model.target_column = candidate
+                        self.adaptive_model.model.preprocessor.target_column = candidate
                     self.log_output(f"🔍 Auto-detected target column: {candidate}")
                     break
             else:
                 # If no candidate found, use the last column
                 if columns:
                     self.target_var.set(columns[-1])
+                    if hasattr(self, 'adaptive_model') and self.adaptive_model is not None:
+                        self.adaptive_model.model.target_column = columns[-1]
+                        self.adaptive_model.model.preprocessor.target_column = columns[-1]
                     self.log_output(f"📝 Using last column as target: {columns[-1]}")
 
         # Create feature checkboxes
@@ -1819,9 +2160,11 @@ class AdaptiveCTDBNNGUI:
             cb.pack(anchor=tk.W, padx=5, pady=2)
 
         # Update the model's target column immediately
+        current_target = self.target_var.get()
         if hasattr(self, 'adaptive_model') and self.adaptive_model is not None:
-            self.adaptive_model.model.target_column = self.target_var.get()
-            self.adaptive_model.model.preprocessor.target_column = self.target_var.get()
+            self.adaptive_model.model.target_column = current_target
+            self.adaptive_model.model.preprocessor.target_column = current_target
+            self.adaptive_model.config['target_column'] = current_target
 
     def select_all_features(self):
         """Select all features"""
@@ -1857,7 +2200,7 @@ class AdaptiveCTDBNNGUI:
         return selected_features
 
     def initialize_model(self):
-        """Initialize the model"""
+        """Initialize the model with current hyperparameters"""
         if not self.data_loaded:
             messagebox.showwarning("Warning", "Please load data first.")
             return
@@ -1865,11 +2208,12 @@ class AdaptiveCTDBNNGUI:
         try:
             self.log_output("🏗️ Initializing CT-DBNN model...")
 
+            # Apply hyperparameters first
+            self.apply_hyperparameters()
+
             # Get selected features and target
             selected_features = self.get_selected_features()
             target_column = self.target_var.get()
-            # Update configuration first
-            self.update_configuration()
 
             if not selected_features:
                 messagebox.showwarning("Warning", "Please select at least one feature.")
@@ -1879,33 +2223,11 @@ class AdaptiveCTDBNNGUI:
                 messagebox.showwarning("Warning", "Please select a target column.")
                 return
 
-            # Update model configuration with ALL parameters from GUI
-            config = {
-                'resol': int(self.resolution_var.get()),
-                'target_column': target_column,
-                'max_epochs': 100,  # Default value
-                'test_size': 0.2,   # Default value
-                'random_state': 42, # Default value
-            }
-
-            # Update all relevant configuration references
-            self.adaptive_model.config.update(config)
-            self.adaptive_model.model.config.update(config)
+            # Update ALL target column references
             self.adaptive_model.model.target_column = target_column
             self.adaptive_model.model.preprocessor.target_column = target_column
-
-            # Update CT-DBNN core configuration
-            if hasattr(self.adaptive_model.model.core, 'config'):
-                self.adaptive_model.model.core.config['resol'] = int(self.resolution_var.get())
-
-            # Update adaptive learning configuration
-            self.adaptive_model.adaptive_config.update({
-                'initial_samples_per_class': int(self.initial_samples_var.get()),
-                'max_adaptive_rounds': int(self.max_rounds_var.get()),
-                'patience': 10,  # Default value
-                'min_improvement': 0.001,  # Default value
-                'enable_acid_test': True,  # Default value
-            })
+            self.adaptive_model.config['target_column'] = target_column
+            self.adaptive_model.target_column = target_column
 
             # Prepare data with selected features
             if target_column not in self.current_data.columns:
@@ -1915,20 +2237,20 @@ class AdaptiveCTDBNNGUI:
 
             selected_data = self.current_data[selected_features + [target_column]]
 
-            # Use the preprocessor with the correct target column
+            # Preprocess with current parameters
             self.adaptive_model.model.preprocessor.target_column = target_column
             X, y, feature_names = self.adaptive_model.model.preprocessor.preprocess_dataset(selected_data)
 
-            # Store the processed data in the adaptive model
+            # Store the preprocessed data
             self.adaptive_model.X_full = X
             self.adaptive_model.y_full = y
-            self.adaptive_model.feature_names = feature_names
+            self.adaptive_model.y_full_original = y.copy()
 
-            self.log_output(f"✅ Model initialized with {len(selected_features)} features")
+            self.log_output(f"✅ Model initialized with hyperparameters")
             self.log_output(f"🎯 Target: {target_column}")
             self.log_output(f"📊 Features: {', '.join(selected_features)}")
             self.log_output(f"🔧 Resolution: {self.resolution_var.get()}")
-            self.log_output(f"🔄 Max Rounds: {self.max_rounds_var.get()}")
+            self.log_output(f"📦 Preprocessed data: {X.shape[0]} samples, {X.shape[1]} features")
 
         except Exception as e:
             self.log_output(f"❌ Error initializing model: {e}")
@@ -1936,51 +2258,51 @@ class AdaptiveCTDBNNGUI:
             self.log_output(f"   Detailed error: {traceback.format_exc()}")
 
     def on_target_changed(self, *args):
-        """Handle target column selection change"""
+        """Handle target column selection change - update ALL references"""
         if hasattr(self, 'adaptive_model') and self.adaptive_model is not None and self.data_loaded:
             target_column = self.target_var.get()
+
+            # Update ALL target column references throughout the system
             self.adaptive_model.model.target_column = target_column
             self.adaptive_model.model.preprocessor.target_column = target_column
             self.adaptive_model.config['target_column'] = target_column
+            self.adaptive_model.target_column = target_column
+
             self.log_output(f"🎯 Target column changed to: {target_column}")
 
     def run_adaptive_learning(self):
-        """Run adaptive learning with better error handling"""
+        """Run adaptive learning with proper data initialization"""
         if not self.data_loaded or self.adaptive_model is None:
             messagebox.showwarning("Warning", "Please load data and initialize model first.")
             return
 
         try:
             self.log_output("🚀 Starting adaptive learning...")
-            # Update configuration first
-            self.update_configuration()
-            # Update ALL adaptive learning configuration from GUI
+
+            # CRITICAL: Ensure target column is synchronized
+            target_column = self.target_var.get()
+            self.adaptive_model.model.target_column = target_column
+            self.adaptive_model.model.preprocessor.target_column = target_column
+            self.adaptive_model.config['target_column'] = target_column
+            self.adaptive_model.target_column = target_column
+
+            # If data hasn't been preprocessed yet, do it now
+            if self.adaptive_model.X_full is None:
+                self.log_output("🔄 Preprocessing data for adaptive learning...")
+                selected_features = self.get_selected_features()
+                selected_data = self.current_data[selected_features + [target_column]]
+
+                X, y, feature_names = self.adaptive_model.model.preprocessor.preprocess_dataset(selected_data)
+                self.adaptive_model.X_full = X
+                self.adaptive_model.y_full = y
+                self.adaptive_model.y_full_original = y.copy()
+                self.log_output(f"✅ Preprocessed {X.shape[0]} samples with {X.shape[1]} features")
+
+            # Update adaptive learning configuration
             self.adaptive_model.adaptive_config.update({
                 'initial_samples_per_class': int(self.initial_samples_var.get()),
                 'max_adaptive_rounds': int(self.max_rounds_var.get()),
-                'patience': 10,  # Default value
-                'min_improvement': 0.001,  # Default value
-                'enable_acid_test': True,  # Default value
             })
-
-            # Update CT-DBNN core resolution if model is already initialized
-            if hasattr(self.adaptive_model.model, 'core') and hasattr(self.adaptive_model.model.core, 'config'):
-                new_resolution = int(self.resolution_var.get())
-                self.adaptive_model.model.core.config['resol'] = new_resolution
-                # Also update the core's resol attribute directly
-                if hasattr(self.adaptive_model.model.core, 'resol'):
-                    self.adaptive_model.model.core.resol = new_resolution
-                self.log_output(f"🔧 Updated resolution to: {new_resolution}")
-
-            self.log_output(f"🎯 Adaptive Learning Configuration:")
-            self.log_output(f"   📊 Initial samples per class: {self.initial_samples_var.get()}")
-            self.log_output(f"   🔄 Max adaptive rounds: {self.max_rounds_var.get()}")
-            self.log_output(f"   🔧 Resolution: {self.resolution_var.get()}")
-
-            # Ensure architecture is initialized
-            if not hasattr(self.adaptive_model.model, 'initialized_with_full_data') or not self.adaptive_model.model.initialized_with_full_data:
-                self.log_output("🏗️ Initializing architecture before adaptive learning...")
-                self.adaptive_model.initialize_architecture()
 
             # Run adaptive learning
             X_train, y_train, X_test, y_test = self.adaptive_model.adaptive_learn()
@@ -1994,7 +2316,6 @@ class AdaptiveCTDBNNGUI:
         except Exception as e:
             error_msg = f"❌ Error during adaptive learning: {e}"
             self.log_output(error_msg)
-            # Show detailed error in message box
             import traceback
             detailed_error = traceback.format_exc()
             self.log_output(f"🔍 Detailed error:\n{detailed_error}")
