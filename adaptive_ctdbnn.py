@@ -56,6 +56,272 @@ except ImportError:
     print("❌ CT-DBNN module not found. Please ensure ct_dbnn.py is in the same directory.")
     exit(1)
 
+import pickle
+import gzip
+import shutil
+
+class ModelSerializer:
+    """Handles saving and loading of complete CT-DBNN model state"""
+
+    @staticmethod
+    def save_model(adaptive_model, file_path):
+        """Save complete model state including configuration, weights, and metadata"""
+        try:
+            # Create model directory if it doesn't exist
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+            # Validate data before saving
+            validation_msg = ModelSerializer._validate_model_before_save(adaptive_model)
+            if validation_msg:
+                print(f"⚠️ Pre-save validation warnings: {validation_msg}")
+
+            # Check label encoder state
+            target_encoder = adaptive_model.model.preprocessor.target_encoder
+            has_label_encoder = (hasattr(target_encoder, 'classes_') and
+                               target_encoder.classes_ is not None and
+                               len(target_encoder.classes_) > 0)
+
+            if has_label_encoder:
+                print(f"✅ Label encoder will be saved with {len(target_encoder.classes_)} classes")
+            else:
+                print("⚠️ No label encoder state to save")
+
+            # Collect all model state information
+            model_state = {
+                'metadata': {
+                    'saved_at': datetime.now().isoformat(),
+                    'dataset_name': adaptive_model.dataset_name,
+                    'version': '1.0',
+                    'model_type': 'AdaptiveCTDBNN',
+                    'has_label_encoder': has_label_encoder,
+                },
+                'config': adaptive_model.config,
+                'adaptive_config': adaptive_model.adaptive_config,
+                'training_state': {
+                    'best_accuracy': getattr(adaptive_model, 'best_accuracy', 0.0),
+                    'best_training_indices': getattr(adaptive_model, 'best_training_indices', []),
+                    'best_round': getattr(adaptive_model, 'best_round', 0),
+                    'adaptive_round': getattr(adaptive_model, 'adaptive_round', 0),
+                    'round_stats': getattr(adaptive_model, 'round_stats', []),
+                },
+                'data_state': {
+                    'X_full': getattr(adaptive_model, 'X_full', None),
+                    'y_full': getattr(adaptive_model, 'y_full', None),
+                    'y_full_original': getattr(adaptive_model, 'y_full_original', None),
+                    'feature_names': getattr(adaptive_model.model, 'feature_names', []),
+                    'target_column': getattr(adaptive_model.model, 'target_column', 'target'),
+                },
+                'preprocessor_state': {
+                    'feature_encoders': adaptive_model.model.preprocessor.feature_encoders,
+                    'target_encoder': adaptive_model.model.preprocessor.target_encoder,
+                    'scaler': adaptive_model.model.preprocessor.scaler,
+                    'missing_value_indicators': adaptive_model.model.preprocessor.missing_value_indicators,
+                },
+                'ctdbnn_core_state': ModelSerializer._extract_ctdbnn_state(adaptive_model.model.core),
+                'label_mappings': {
+                    'class_to_label': getattr(adaptive_model, 'class_to_label', {}),
+                    'label_to_class': getattr(adaptive_model, 'label_to_class', {}),
+                }
+            }
+
+            # Save with compression
+            with gzip.open(file_path, 'wb') as f:
+                pickle.dump(model_state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            return True, f"Model saved successfully to {file_path}"
+
+        except Exception as e:
+            return False, f"Error saving model: {e}"
+
+    @staticmethod
+    def _validate_model_before_save(adaptive_model):
+        """Validate model state before saving"""
+        warnings = []
+
+        try:
+            # Check data consistency
+            if (adaptive_model.X_full is not None and
+                adaptive_model.y_full is not None):
+
+                if len(adaptive_model.X_full) != len(adaptive_model.y_full):
+                    warnings.append("X and y have different lengths")
+
+                if (hasattr(adaptive_model.model, 'feature_names') and
+                    adaptive_model.X_full.shape[1] != len(adaptive_model.model.feature_names)):
+                    warnings.append("Feature count doesn't match feature names")
+
+            # Check if model is trained
+            if not getattr(adaptive_model, 'model_trained', False):
+                warnings.append("Model not marked as trained")
+
+        except Exception as e:
+            warnings.append(f"Pre-save validation error: {e}")
+
+        return "; ".join(warnings) if warnings else ""
+
+
+    @staticmethod
+    def _extract_ctdbnn_state(core_model):
+        """Extract all relevant state from CT-DBNN core"""
+        state = {}
+        try:
+            # Get all attributes that are likely to be important for the model
+            important_attrs = [
+                'global_anti_net', 'global_likelihoods', 'likelihoods_computed',
+                'orthogonal_weights', 'is_trained', 'resol', 'innodes', 'outnodes',
+                'feature_bins', 'feature_min', 'feature_max', 'n_bins',
+                'class_labels', 'unique_classes', 'posterior_cache'
+            ]
+
+            for attr in important_attrs:
+                if hasattr(core_model, attr):
+                    state[attr] = getattr(core_model, attr)
+
+            # Add any tensor-specific attributes
+            tensor_attrs = ['complex_tensor', 'real_tensor', 'weight_tensor']
+            for attr in tensor_attrs:
+                if hasattr(core_model, attr):
+                    # Convert tensors to numpy for serialization if they're torch tensors
+                    tensor_value = getattr(core_model, attr)
+                    if hasattr(tensor_value, 'detach'):
+                        state[attr] = tensor_value.detach().cpu().numpy()
+                    else:
+                        state[attr] = tensor_value
+
+        except Exception as e:
+            print(f"Warning: Could not extract some CT-DBNN state: {e}")
+
+        return state
+
+    @staticmethod
+    def load_model(file_path, adaptive_model=None):
+        """Load complete model state from file with better error handling"""
+        try:
+            if not os.path.exists(file_path):
+                return False, None, f"Model file not found: {file_path}"
+
+            # Load compressed model state
+            with gzip.open(file_path, 'rb') as f:
+                model_state = pickle.load(f)
+
+            # Verify model compatibility
+            if model_state['metadata']['model_type'] != 'AdaptiveCTDBNN':
+                return False, None, "Invalid model file format"
+
+            if adaptive_model is None:
+                # Create new adaptive model
+                dataset_name = model_state['metadata']['dataset_name']
+                config = model_state['config']
+                adaptive_model = AdaptiveCTDBNN(dataset_name, config)
+
+            # Restore configuration
+            adaptive_model.config.update(model_state['config'])
+            adaptive_model.adaptive_config.update(model_state['adaptive_config'])
+
+            # Restore training state
+            training_state = model_state['training_state']
+            adaptive_model.best_accuracy = training_state['best_accuracy']
+            adaptive_model.best_training_indices = training_state['best_training_indices']
+            adaptive_model.best_round = training_state['best_round']
+            adaptive_model.adaptive_round = training_state['adaptive_round']
+            adaptive_model.round_stats = training_state['round_stats']
+
+            # Restore data state - FIX: Handle potential dimension issues
+            data_state = model_state['data_state']
+            adaptive_model.X_full = data_state['X_full']
+            adaptive_model.y_full = data_state['y_full']
+            adaptive_model.y_full_original = data_state['y_full_original']
+
+            # Ensure feature names and target column are properly set
+            adaptive_model.model.feature_names = data_state.get('feature_names', [])
+            adaptive_model.model.target_column = data_state.get('target_column', 'target')
+            adaptive_model.target_column = data_state.get('target_column', 'target')
+
+            # Restore preprocessor state
+            preprocessor_state = model_state['preprocessor_state']
+            adaptive_model.model.preprocessor.feature_encoders = preprocessor_state['feature_encoders']
+            adaptive_model.model.preprocessor.target_encoder = preprocessor_state['target_encoder']
+            adaptive_model.model.preprocessor.scaler = preprocessor_state['scaler']
+            adaptive_model.model.preprocessor.missing_value_indicators = preprocessor_state['missing_value_indicators']
+
+            # Restore CT-DBNN core state
+            ModelSerializer._restore_ctdbnn_state(adaptive_model.model.core, model_state['ctdbnn_core_state'])
+
+            # Restore label mappings
+            label_mappings = model_state['label_mappings']
+            adaptive_model.class_to_label = label_mappings['class_to_label']
+            adaptive_model.label_to_class = label_mappings['label_to_class']
+
+            # Mark model as trained
+            adaptive_model.model_trained = True
+            adaptive_model.model.core.is_trained = True
+            adaptive_model.model.is_trained = True
+
+            # Validate data consistency
+            validation_msg = ModelSerializer._validate_loaded_model(adaptive_model)
+            if validation_msg:
+                print(f"⚠️ Model validation warning: {validation_msg}")
+
+            return True, adaptive_model, f"Model loaded successfully from {file_path}"
+
+        except Exception as e:
+            return False, None, f"Error loading model: {e}"
+
+    @staticmethod
+    def _validate_loaded_model(adaptive_model):
+        """Validate the consistency of the loaded model"""
+        warnings = []
+
+        try:
+            # Check data dimensions
+            if (adaptive_model.X_full is not None and
+                adaptive_model.y_full is not None and
+                hasattr(adaptive_model.model, 'feature_names')):
+
+                n_samples_x = adaptive_model.X_full.shape[0]
+                n_samples_y = len(adaptive_model.y_full)
+                n_features = adaptive_model.X_full.shape[1]
+                n_feature_names = len(adaptive_model.model.feature_names)
+
+                if n_samples_x != n_samples_y:
+                    warnings.append(f"Sample count mismatch: X has {n_samples_x}, y has {n_samples_y}")
+
+                if n_features != n_feature_names:
+                    warnings.append(f"Feature count mismatch: X has {n_features}, feature_names has {n_feature_names}")
+
+            # Check if core model is properly initialized
+            if not hasattr(adaptive_model.model.core, 'is_trained') or not adaptive_model.model.core.is_trained:
+                warnings.append("Core model not marked as trained")
+
+            # Check preprocessor state
+            if not hasattr(adaptive_model.model.preprocessor, 'target_encoder'):
+                warnings.append("Preprocessor target encoder missing")
+
+        except Exception as e:
+            warnings.append(f"Validation error: {e}")
+
+        return "; ".join(warnings) if warnings else ""
+
+    @staticmethod
+    def _restore_ctdbnn_state(core_model, state_dict):
+        """Restore CT-DBNN core state"""
+        try:
+            for key, value in state_dict.items():
+                if hasattr(core_model, key):
+                    # Handle tensor restoration if needed
+                    if key in ['complex_tensor', 'real_tensor', 'weight_tensor'] and value is not None:
+                        if torch.is_tensor(getattr(core_model, key, None)):
+                            # Convert numpy back to tensor
+                            value = torch.from_numpy(value)
+                    setattr(core_model, key, value)
+
+            # Mark as initialized
+            core_model.likelihoods_computed = True
+            core_model.is_trained = True
+
+        except Exception as e:
+            print(f"Warning: Could not restore some CT-DBNN state: {e}")
+
 class MemoryManager:
     """Memory management for large dataset processing"""
 
@@ -883,6 +1149,10 @@ class OptimizedCTDBNNWrapper:
         """Step 1: Initialize CT-DBNN architecture with full dataset - NO TRAINING"""
         print("🏗️ Initializing CT-DBNN architecture with full dataset...")
 
+        # Store the full data for reference
+        self.X_full = X
+        self.y_full = y
+
         # Create temporary file with full data
         temp_file = f"temp_full_init_{int(time.time())}.csv"
         feature_cols = [f'feature_{i}' for i in range(X.shape[1])]
@@ -903,6 +1173,14 @@ class OptimizedCTDBNNWrapper:
             X_temp = X_temp.drop(columns=[self.target_column]).values
 
             self.core.compute_global_likelihoods(X_temp, y_temp, feature_cols)
+
+            # Store feature information for serialization
+            self.core.feature_bins = getattr(self.core, 'feature_bins', None)
+            self.core.feature_min = getattr(self.core, 'feature_min', None)
+            self.core.feature_max = getattr(self.core, 'feature_max', None)
+            self.core.n_bins = getattr(self.core, 'n_bins', None)
+            self.core.unique_classes = np.unique(y)
+            self.core.class_labels = self.core.unique_classes.tolist()
 
             # Initialize orthogonal weights with memory cleanup
             print("🔄 Initializing orthogonal weights...")
@@ -1484,6 +1762,517 @@ class AdaptiveCTDBNNGUI:
 
         self.setup_gui()
 
+    def save_model(self):
+        """Save the current model to file"""
+        if not hasattr(self, 'adaptive_model') or self.adaptive_model is None:
+            messagebox.showwarning("Warning", "No model to save. Please initialize and train a model first.")
+            return
+
+        if not self.model_trained:
+            messagebox.showwarning("Warning", "Model is not trained yet. Please train the model before saving.")
+            return
+
+        try:
+            # Determine default file path
+            dataset_name = self.dataset_var.get()
+            default_filename = f"{dataset_name}.bin"
+            models_dir = "Models"
+            os.makedirs(models_dir, exist_ok=True)
+            default_path = os.path.join(models_dir, default_filename)
+
+            # Ask for file path
+            file_path = filedialog.asksaveasfilename(
+                title="Save Model As",
+                initialdir="Models",
+                initialfile=default_filename,
+                defaultextension=".bin",
+                filetypes=[("Binary Model Files", "*.bin"), ("All files", "*.*")]
+            )
+
+            if not file_path:
+                return  # User cancelled
+
+            # Save the model
+            success, message = ModelSerializer.save_model(self.adaptive_model, file_path)
+
+            if success:
+                self.log_output(f"💾 {message}")
+                self.log_output(f"📁 Model saved to: {file_path}")
+
+                # Show model info
+                file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                self.log_output(f"📊 Model file size: {file_size:.2f} MB")
+            else:
+                self.log_output(f"❌ {message}")
+                messagebox.showerror("Save Error", message)
+
+        except Exception as e:
+            error_msg = f"❌ Error saving model: {e}"
+            self.log_output(error_msg)
+            messagebox.showerror("Save Error", error_msg)
+
+    def show_label_encoding_info(self):
+        """Display information about label encoding for the current model"""
+        if not hasattr(self, 'adaptive_model') or self.adaptive_model is None:
+            messagebox.showwarning("Warning", "No model loaded.")
+            return
+
+        try:
+            target_encoder = self.adaptive_model.model.preprocessor.target_encoder
+
+            if (hasattr(target_encoder, 'classes_') and
+                target_encoder.classes_ is not None and
+                len(target_encoder.classes_) > 0):
+
+                encoding_info = "🔤 Label Encoding Information:\n"
+                encoding_info += f"Number of classes: {len(target_encoder.classes_)}\n\n"
+                encoding_info += "Class Mapping:\n"
+
+                for i, class_name in enumerate(target_encoder.classes_):
+                    encoding_info += f"  {i} → '{class_name}'\n"
+
+                # Show in output log
+                self.log_output(encoding_info)
+
+                # Also show in message box for easy viewing
+                messagebox.showinfo("Label Encoding Info",
+                                  f"Label encoder has {len(target_encoder.classes_)} classes:\n" +
+                                  "\n".join([f"{i} → '{cls}'" for i, cls in enumerate(target_encoder.classes_)]))
+            else:
+                self.log_output("⚠️ No label encoder information available")
+                messagebox.showinfo("Label Encoding Info", "No label encoder information available.")
+
+        except Exception as e:
+            self.log_output(f"❌ Error getting label encoding info: {e}")
+
+    def load_model(self):
+        """Load a model from file with proper DataFrame reconstruction and label encoding"""
+        try:
+            # Ask for file path
+            file_path = filedialog.askopenfilename(
+                title="Load Model",
+                initialdir="Models",
+                filetypes=[("Binary Model Files", "*.bin"), ("All files", "*.*")]
+            )
+
+            if not file_path:
+                return  # User cancelled
+
+            # Load the model
+            success, loaded_model, message = ModelSerializer.load_model(file_path)
+
+            if success:
+                self.adaptive_model = loaded_model
+                self.model_trained = True
+                self.data_loaded = True
+
+                # Update GUI state
+                self.dataset_var.set(self.adaptive_model.dataset_name)
+
+                # Properly reconstruct the DataFrame without dimension mismatch
+                self._reconstruct_data_from_loaded_model()
+
+                # Update target column
+                self.target_var.set(self.adaptive_model.model.target_column)
+
+                # Update feature selection
+                self.update_feature_selection()
+
+                # Load hyperparameters from the loaded model
+                self._update_gui_from_loaded_model()
+
+                # Check label encoder status
+                target_encoder = self.adaptive_model.model.preprocessor.target_encoder
+                has_label_encoder = (hasattr(target_encoder, 'classes_') and
+                                   target_encoder.classes_ is not None and
+                                   len(target_encoder.classes_) > 0)
+
+                self.log_output(f"📂 {message}")
+                self.log_output(f"🎯 Loaded model for dataset: {self.adaptive_model.dataset_name}")
+                self.log_output(f"🏆 Best accuracy: {self.adaptive_model.best_accuracy:.4f}")
+                self.log_output(f"📊 Training rounds: {self.adaptive_model.adaptive_round}")
+
+                if has_label_encoder:
+                    self.log_output(f"🔤 Label encoder available with {len(target_encoder.classes_)} classes")
+                    self.log_output(f"📋 Class labels: {list(target_encoder.classes_)}")
+                else:
+                    self.log_output("⚠️ No label encoder found - predictions will use numeric labels")
+
+            else:
+                self.log_output(f"❌ {message}")
+                messagebox.showerror("Load Error", message)
+
+        except Exception as e:
+            error_msg = f"❌ Error loading model: {e}"
+            self.log_output(error_msg)
+            import traceback
+            self.log_output(f"🔍 Detailed traceback:\n{traceback.format_exc()}")
+            messagebox.showerror("Load Error", error_msg)
+
+    def safe_dataframe_reconstruction(self, X, y, feature_names, target_column):
+        """Safely reconstruct DataFrame handling various dimension scenarios"""
+        try:
+            if X is None or y is None:
+                self.log_output("❌ No data available for reconstruction")
+                return None
+
+            n_samples, n_features = X.shape
+
+            # Handle feature names mismatch
+            if len(feature_names) != n_features:
+                self.log_output(f"⚠️ Feature count mismatch: {len(feature_names)} names vs {n_features} features")
+                # Use generic feature names
+                feature_names = [f'feature_{i}' for i in range(n_features)]
+
+            # Ensure y has correct shape
+            if len(y) != n_samples:
+                self.log_output(f"⚠️ Sample count mismatch: X has {n_samples}, y has {len(y)}")
+                # Truncate to minimum length
+                min_length = min(n_samples, len(y))
+                X = X[:min_length]
+                y = y[:min_length]
+                n_samples = min_length
+
+            # Create DataFrame
+            data_dict = {}
+            for i, feature_name in enumerate(feature_names):
+                data_dict[feature_name] = X[:, i]
+
+            data_dict[target_column] = y
+
+            df = pd.DataFrame(data_dict)
+            self.log_output(f"✅ Successfully reconstructed DataFrame: {df.shape}")
+            return df
+
+        except Exception as e:
+            self.log_output(f"❌ Error in DataFrame reconstruction: {e}")
+            return None
+
+    def _reconstruct_data_from_loaded_model(self):
+        """Properly reconstruct DataFrame from loaded model without dimension errors"""
+        try:
+            if (hasattr(self.adaptive_model, 'X_full') and
+                hasattr(self.adaptive_model, 'y_full') and
+                hasattr(self.adaptive_model.model, 'feature_names') and
+                hasattr(self.adaptive_model.model, 'target_column')):
+
+                X = self.adaptive_model.X_full
+                y = self.adaptive_model.y_full
+                feature_names = self.adaptive_model.model.feature_names
+                target_column = self.adaptive_model.model.target_column
+                self.current_data = self.safe_dataframe_reconstruction(X, y, feature_names, target_column)
+
+                # Ensure dimensions match
+                if X is not None and y is not None:
+                    # Check if feature names match the number of features in X
+                    if len(feature_names) == X.shape[1]:
+                        # Create DataFrame with correct dimensions
+                        data_dict = {}
+                        for i, feature_name in enumerate(feature_names):
+                            data_dict[feature_name] = X[:, i]
+
+                        # Add target column
+                        data_dict[target_column] = y
+
+                        self.current_data = pd.DataFrame(data_dict)
+                        self.log_output(f"✅ Reconstructed DataFrame: {self.current_data.shape}")
+
+                    else:
+                        self.log_output(f"⚠️ Feature count mismatch: {len(feature_names)} names vs {X.shape[1]} features")
+                        # Fallback: create generic feature names
+                        feature_cols = [f'feature_{i}' for i in range(X.shape[1])]
+                        data_dict = {col: X[:, i] for i, col in enumerate(feature_cols)}
+                        data_dict[target_column] = y
+                        self.current_data = pd.DataFrame(data_dict)
+                else:
+                    self.log_output("⚠️ No data available in loaded model")
+                    self.current_data = None
+
+            else:
+                self.log_output("⚠️ Incomplete model state for data reconstruction")
+                self.current_data = None
+
+        except Exception as e:
+            self.log_output(f"❌ Error reconstructing data: {e}")
+            self.current_data = None
+
+    def _update_gui_from_loaded_model(self):
+        """Update GUI controls from loaded model configuration"""
+        if not hasattr(self, 'adaptive_model') or self.adaptive_model is None:
+            return
+
+        try:
+            config = self.adaptive_model.config
+
+            # Update CT-DBNN parameters
+            ctdbnn_config = config.get('ctdbnn_config', {})
+            self.resolution_var.set(str(ctdbnn_config.get('resol', 100)))
+            self.learning_rate_var.set(str(ctdbnn_config.get('learning_rate', 0.01)))
+            self.max_epochs_var.set(str(ctdbnn_config.get('max_epochs', 100)))
+            self.batch_size_var.set(str(ctdbnn_config.get('batch_size', 32)))
+            self.smoothing_factor_var.set(str(ctdbnn_config.get('smoothing_factor', '1e-8')))
+            self.use_complex_var.set(ctdbnn_config.get('use_complex_tensor', True))
+            self.orthogonalize_var.set(ctdbbnn_config.get('orthogonalize_weights', True))
+            self.parallel_var.set(ctdbnn_config.get('parallel_processing', True))
+
+            # Update adaptive learning parameters
+            adaptive_config = self.adaptive_model.adaptive_config
+            self.initial_samples_var.set(str(adaptive_config.get('initial_samples_per_class', 5)))
+            self.max_rounds_var.set(str(adaptive_config.get('max_adaptive_rounds', 20)))
+            self.patience_var.set(str(adaptive_config.get('patience', 10)))
+            self.min_improvement_var.set(str(adaptive_config.get('min_improvement', 0.001)))
+            self.enable_acid_var.set(adaptive_config.get('enable_acid_test', True))
+
+            self.log_output("✅ GUI updated from loaded model configuration")
+
+        except Exception as e:
+            self.log_output(f"⚠️ Could not fully update GUI from model: {e}")
+
+    def predict_file(self):
+        """Predict on a file and save results with memory-efficient chunking"""
+        if not hasattr(self, 'adaptive_model') or self.adaptive_model is None or not self.model_trained:
+            messagebox.showwarning("Warning", "No trained model available. Please train or load a model first.")
+            return
+
+        try:
+            # Ask for input file
+            input_file = filedialog.askopenfilename(
+                title="Select File for Prediction",
+                filetypes=[("CSV files", "*.csv"), ("Data files", "*.data"), ("Text files", "*.txt"), ("All files", "*.*")]
+            )
+
+            if not input_file:
+                return  # User cancelled
+
+            # Determine output file
+            dataset_name = self.dataset_var.get()
+            base_name = os.path.splitext(os.path.basename(input_file))[0]
+            output_file = f"{base_name}_prediction.csv"
+
+            # Ask for output location
+            output_file = filedialog.asksaveasfilename(
+                title="Save Predictions As",
+                initialfile=output_file,
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            )
+
+            if not output_file:
+                return  # User cancelled
+
+            # Perform prediction with chunking
+            success, message = self._predict_file_chunked(input_file, output_file)
+
+            if success:
+                self.log_output(f"🔮 {message}")
+
+                # Show prediction summary
+                if os.path.exists(output_file):
+                    result_df = pd.read_csv(output_file)
+                    n_predictions = len(result_df)
+                    n_classes = len([col for col in result_df.columns if col.startswith('pred_')])
+                    self.log_output(f"📊 Predictions completed: {n_predictions} samples")
+                    self.log_output(f"🎯 Top classes saved: {n_classes} per sample")
+                    self.log_output(f"💾 Results saved to: {output_file}")
+
+            else:
+                self.log_output(f"❌ {message}")
+                messagebox.showerror("Prediction Error", message)
+
+        except Exception as e:
+            error_msg = f"❌ Error during prediction: {e}"
+            self.log_output(error_msg)
+            messagebox.showerror("Prediction Error", error_msg)
+
+    def _predict_file_chunked(self, input_file, output_file, chunk_size=1000):
+        """Predict on file in chunks to save memory with proper label decoding"""
+        try:
+            self.log_output(f"🔮 Starting prediction on {input_file}")
+            self.log_output(f"📁 Processing in chunks of {chunk_size} samples")
+
+            # Get the model and feature information
+            model = self.adaptive_model.model
+            feature_names = getattr(model, 'feature_names', [])
+            target_column = model.target_column
+
+            # Check if we have a label encoder for decoding
+            target_encoder = model.preprocessor.target_encoder
+            can_decode = (hasattr(target_encoder, 'classes_') and
+                         target_encoder.classes_ is not None and
+                         len(target_encoder.classes_) > 0)
+
+            if can_decode:
+                self.log_output("✅ Label encoder available - will decode predictions to original labels")
+                original_classes = target_encoder.classes_
+                self.log_output(f"📋 Original class labels: {list(original_classes)}")
+            else:
+                self.log_output("⚠️ No label encoder found - using numeric class labels")
+
+            # Read first chunk to get column information
+            first_chunk = pd.read_csv(input_file, nrows=1)
+            all_columns = first_chunk.columns.tolist()
+
+            # Determine which columns to use for prediction
+            prediction_columns = [col for col in feature_names if col in all_columns]
+            if not prediction_columns:
+                prediction_columns = [col for col in all_columns if col != target_column]
+
+            self.log_output(f"🎯 Using {len(prediction_columns)} features for prediction")
+            self.log_output(f"📋 Features: {', '.join(prediction_columns)}")
+
+            # Initialize output
+            header_written = False
+            total_samples = 0
+            processed_size = 0
+            total_size = os.path.getsize(input_file)
+
+            # Process file in chunks
+            for chunk_idx, chunk in enumerate(pd.read_csv(input_file, chunksize=chunk_size)):
+                chunk_size_bytes = chunk.memory_usage(deep=True).sum()
+                processed_size += chunk_size_bytes
+
+                progress = (processed_size / total_size) * 100 if total_size > 0 else 0
+                self.log_output(f"📦 Processing chunk {chunk_idx + 1} ({progress:.1f}%)...")
+
+                # Make a copy to avoid modifying original
+                chunk_data = chunk.copy()
+
+                # Prepare features for prediction
+                X_pred = chunk_data[prediction_columns].values
+
+                # Get predictions and probabilities
+                predictions = model.predict(X_pred)
+                probabilities = model._compute_batch_posterior(X_pred)
+
+                # Get unique classes from the model
+                if hasattr(model.core, 'unique_classes'):
+                    unique_classes = model.core.unique_classes
+                else:
+                    unique_classes = np.unique(self.adaptive_model.y_full)
+
+                # Add prediction results to chunk with label decoding
+                chunk_data = self._add_prediction_results(
+                    chunk_data, predictions, probabilities, unique_classes
+                )
+
+                # Save chunk to output file
+                mode = 'w' if not header_written else 'a'
+                header = not header_written
+
+                chunk_data.to_csv(output_file, mode=mode, header=header, index=False)
+                header_written = True
+
+                total_samples += len(chunk_data)
+                self.log_output(f"   ✅ Chunk {chunk_idx + 1}: {len(chunk_data)} samples processed")
+
+                # Memory cleanup
+                del chunk_data, X_pred, predictions, probabilities
+                if chunk_idx % 10 == 0:  # Clean memory every 10 chunks
+                    gc.collect()
+
+            self.log_output(f"✅ Prediction completed: {total_samples} samples processed")
+
+            # Show sample of decoded predictions if available
+            if can_decode and os.path.exists(output_file):
+                result_sample = pd.read_csv(output_file, nrows=5)
+                if 'prediction' in result_sample.columns:
+                    sample_predictions = result_sample['prediction'].head(3).tolist()
+                    self.log_output(f"🔍 Sample predictions: {sample_predictions}")
+
+            return True, f"Prediction completed: {total_samples} samples processed"
+
+        except Exception as e:
+            return False, f"Prediction error: {e}"
+
+    def _add_prediction_results(self, chunk_data, predictions, probabilities, unique_classes):
+        """Add prediction results to chunk data with top winners and decoded labels"""
+        try:
+            # Get the target encoder from the model
+            target_encoder = self.adaptive_model.model.preprocessor.target_encoder
+
+            # Check if we have a fitted label encoder for decoding
+            if (hasattr(target_encoder, 'classes_') and
+                target_encoder.classes_ is not None and
+                len(target_encoder.classes_) > 0):
+
+                # Decode the primary prediction
+                try:
+                    decoded_predictions = target_encoder.inverse_transform(predictions)
+                    chunk_data['prediction'] = decoded_predictions
+                except Exception as e:
+                    self.log_output(f"⚠️ Could not decode primary predictions: {e}")
+                    chunk_data['prediction'] = predictions
+
+                # Get top classes for each sample based on posterior probabilities
+                n_top = min(5, len(unique_classes))  # Maximum 5 top classes
+
+                for i in range(n_top):
+                    # Get the i-th highest probability and corresponding class for each sample
+                    top_indices = np.argsort(probabilities, axis=1)[:, -(i+1)]
+                    top_probs = probabilities[np.arange(len(probabilities)), top_indices]
+                    top_classes = unique_classes[top_indices]
+
+                    # Only keep predictions with probability > 1/3 of max probability for that sample
+                    max_probs = np.max(probabilities, axis=1)
+                    keep_mask = top_probs > (max_probs / 3.0)
+
+                    # Set low-confidence predictions to NaN
+                    top_classes[~keep_mask] = -1  # Use -1 for invalid, we'll handle this
+                    top_probs[~keep_mask] = np.nan
+
+                    # Decode the class labels
+                    try:
+                        decoded_top_classes = target_encoder.inverse_transform(top_classes)
+                        # Replace -1 with NaN for invalid predictions
+                        decoded_top_classes = np.where(top_classes == -1, np.nan, decoded_top_classes)
+                    except Exception as e:
+                        self.log_output(f"⚠️ Could not decode top class {i+1}: {e}")
+                        decoded_top_classes = np.where(top_classes == -1, np.nan, top_classes)
+
+                    chunk_data[f'pred_class_{i+1}'] = decoded_top_classes
+                    chunk_data[f'pred_prob_{i+1}'] = top_probs
+
+            else:
+                # No label encoder available, use numeric labels
+                self.log_output("⚠️ No label encoder found, using numeric predictions")
+                chunk_data['prediction'] = predictions
+
+                # Get top classes without decoding
+                n_top = min(5, len(unique_classes))
+
+                for i in range(n_top):
+                    top_indices = np.argsort(probabilities, axis=1)[:, -(i+1)]
+                    top_probs = probabilities[np.arange(len(probabilities)), top_indices]
+                    top_classes = unique_classes[top_indices]
+
+                    max_probs = np.max(probabilities, axis=1)
+                    keep_mask = top_probs > (max_probs / 3.0)
+
+                    top_classes[~keep_mask] = np.nan
+                    top_probs[~keep_mask] = np.nan
+
+                    chunk_data[f'pred_class_{i+1}'] = top_classes
+                    chunk_data[f'pred_prob_{i+1}'] = top_probs
+
+            # Add confidence score (max probability)
+            chunk_data['confidence'] = np.max(probabilities, axis=1)
+
+            return chunk_data
+
+        except Exception as e:
+            self.log_output(f"❌ Error adding prediction results: {e}")
+            # Fallback: just add basic prediction
+            chunk_data['prediction'] = predictions
+            chunk_data['confidence'] = np.max(probabilities, axis=1)
+            return chunk_data
+
+    def exit_application(self):
+        """Exit the application with confirmation"""
+        if messagebox.askokcancel("Exit", "Are you sure you want to exit?"):
+            self.log_output("👋 Exiting Adaptive CT-DBNN Application...")
+            self.root.quit()
+            self.root.destroy()
+
     def load_default_parameters(self):
         """Load default hyperparameters for the current dataset"""
         if not hasattr(self, 'adaptive_model') or self.adaptive_model is None:
@@ -1821,6 +2610,8 @@ class AdaptiveCTDBNNGUI:
                   command=self.reset_to_dataset_defaults).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Apply Parameters",
                   command=self.apply_hyperparameters).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(button_frame, text="Show Label Info",
+                  command=self.show_label_encoding_info, width=12).pack(side=tk.LEFT, padx=2)
 
         # Configure column weights for responsive layout
         for frame in [core_frame, adaptive_frame, preprocessing_frame]:
