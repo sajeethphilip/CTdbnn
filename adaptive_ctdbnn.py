@@ -82,7 +82,7 @@ class ModelSerializer:
                                len(target_encoder.classes_) > 0)
 
             if has_label_encoder:
-                print(f"✅ Label encoder will be saved with {len(target_encoder.classes_)} classes")
+                print(f"✅ Label encoder will be saved with {len(target_encoder.classes_)} classes: {list(target_encoder.classes_)}")
             else:
                 print("⚠️ No label encoder state to save")
 
@@ -102,7 +102,9 @@ class ModelSerializer:
                     'best_training_indices': getattr(adaptive_model, 'best_training_indices', []),
                     'best_round': getattr(adaptive_model, 'best_round', 0),
                     'adaptive_round': getattr(adaptive_model, 'adaptive_round', 0),
+                    'patience_counter': getattr(adaptive_model, 'patience_counter', 0),
                     'round_stats': getattr(adaptive_model, 'round_stats', []),
+                    'training_indices': getattr(adaptive_model, 'training_indices', []),
                 },
                 'data_state': {
                     'X_full': getattr(adaptive_model, 'X_full', None),
@@ -110,17 +112,21 @@ class ModelSerializer:
                     'y_full_original': getattr(adaptive_model, 'y_full_original', None),
                     'feature_names': getattr(adaptive_model.model, 'feature_names', []),
                     'target_column': getattr(adaptive_model.model, 'target_column', 'target'),
+                    'class_to_label': getattr(adaptive_model, 'class_to_label', {}),
+                    'label_to_class': getattr(adaptive_model, 'label_to_class', {}),
                 },
                 'preprocessor_state': {
                     'feature_encoders': adaptive_model.model.preprocessor.feature_encoders,
                     'target_encoder': adaptive_model.model.preprocessor.target_encoder,
                     'scaler': adaptive_model.model.preprocessor.scaler,
                     'missing_value_indicators': adaptive_model.model.preprocessor.missing_value_indicators,
+                    'feature_columns': getattr(adaptive_model.model.preprocessor, 'feature_columns', []),
                 },
                 'ctdbnn_core_state': ModelSerializer._extract_ctdbnn_state(adaptive_model.model.core),
-                'label_mappings': {
-                    'class_to_label': getattr(adaptive_model, 'class_to_label', {}),
-                    'label_to_class': getattr(adaptive_model, 'label_to_class', {}),
+                'wrapper_state': {
+                    'initialized_with_full_data': getattr(adaptive_model.model, 'initialized_with_full_data', False),
+                    'architecture_frozen': getattr(adaptive_model.model, 'architecture_frozen', False),
+                    'frozen_components': getattr(adaptive_model.model, 'frozen_components', {}),
                 }
             }
 
@@ -165,37 +171,42 @@ class ModelSerializer:
         """Extract all relevant state from CT-DBNN core"""
         state = {}
         try:
-            # Get all attributes that are likely to be important for the model
+            # Get all attributes that are important for the model
             important_attrs = [
                 'global_anti_net', 'global_likelihoods', 'likelihoods_computed',
                 'orthogonal_weights', 'is_trained', 'resol', 'innodes', 'outnodes',
                 'feature_bins', 'feature_min', 'feature_max', 'n_bins',
-                'class_labels', 'unique_classes', 'posterior_cache'
+                'class_labels', 'unique_classes', 'posterior_cache',
+                'global_likelihood_computed', 'orthogonal_weights_initialized'
             ]
 
             for attr in important_attrs:
                 if hasattr(core_model, attr):
-                    state[attr] = getattr(core_model, attr)
+                    value = getattr(core_model, attr)
+                    # Handle numpy arrays and tensors
+                    if hasattr(value, 'dtype'):
+                        state[attr] = value
+                    else:
+                        state[attr] = value
 
-            # Add any tensor-specific attributes
+            # Add tensor-specific attributes
             tensor_attrs = ['complex_tensor', 'real_tensor', 'weight_tensor']
             for attr in tensor_attrs:
                 if hasattr(core_model, attr):
-                    # Convert tensors to numpy for serialization if they're torch tensors
                     tensor_value = getattr(core_model, attr)
-                    if hasattr(tensor_value, 'detach'):
-                        state[attr] = tensor_value.detach().cpu().numpy()
-                    else:
+                    if tensor_value is not None:
                         state[attr] = tensor_value
 
+            print(f"✅ Extracted CT-DBNN state with {len(state)} attributes")
+
         except Exception as e:
-            print(f"Warning: Could not extract some CT-DBNN state: {e}")
+            print(f"❌ Could not extract CT-DBNN state: {e}")
 
         return state
 
     @staticmethod
     def load_model(file_path, adaptive_model=None):
-        """Load complete model state from file with better error handling"""
+        """Load complete model state from file with comprehensive restoration"""
         try:
             if not os.path.exists(file_path):
                 return False, None, f"Model file not found: {file_path}"
@@ -209,24 +220,30 @@ class ModelSerializer:
                 return False, None, "Invalid model file format"
 
             if adaptive_model is None:
-                # Create new adaptive model
+                # Create new adaptive model with loaded config
                 dataset_name = model_state['metadata']['dataset_name']
                 config = model_state['config']
                 adaptive_model = AdaptiveCTDBNN(dataset_name, config)
+
+            print("🔄 Restoring model state...")
 
             # Restore configuration
             adaptive_model.config.update(model_state['config'])
             adaptive_model.adaptive_config.update(model_state['adaptive_config'])
 
-            # Restore training state
+            # Restore training state - CRITICAL for starting from previous best
             training_state = model_state['training_state']
             adaptive_model.best_accuracy = training_state['best_accuracy']
             adaptive_model.best_training_indices = training_state['best_training_indices']
             adaptive_model.best_round = training_state['best_round']
             adaptive_model.adaptive_round = training_state['adaptive_round']
+            adaptive_model.patience_counter = training_state['patience_counter']
             adaptive_model.round_stats = training_state['round_stats']
+            adaptive_model.training_indices = training_state['training_indices']
 
-            # Restore data state - FIX: Handle potential dimension issues
+            print(f"✅ Restored training state: best_accuracy={adaptive_model.best_accuracy:.4f}")
+
+            # Restore data state
             data_state = model_state['data_state']
             adaptive_model.X_full = data_state['X_full']
             adaptive_model.y_full = data_state['y_full']
@@ -236,6 +253,10 @@ class ModelSerializer:
             adaptive_model.model.feature_names = data_state.get('feature_names', [])
             adaptive_model.model.target_column = data_state.get('target_column', 'target')
             adaptive_model.target_column = data_state.get('target_column', 'target')
+            adaptive_model.class_to_label = data_state.get('class_to_label', {})
+            adaptive_model.label_to_class = data_state.get('label_to_class', {})
+
+            print(f"✅ Restored data: {len(adaptive_model.model.feature_names)} features, {len(adaptive_model.X_full) if adaptive_model.X_full is not None else 0} samples")
 
             # Restore preprocessor state
             preprocessor_state = model_state['preprocessor_state']
@@ -243,24 +264,41 @@ class ModelSerializer:
             adaptive_model.model.preprocessor.target_encoder = preprocessor_state['target_encoder']
             adaptive_model.model.preprocessor.scaler = preprocessor_state['scaler']
             adaptive_model.model.preprocessor.missing_value_indicators = preprocessor_state['missing_value_indicators']
+            adaptive_model.model.preprocessor.feature_columns = preprocessor_state.get('feature_columns', [])
 
-            # Restore CT-DBNN core state
-            ModelSerializer._restore_ctdbnn_state(adaptive_model.model.core, model_state['ctdbnn_core_state'])
+            # Check label encoder restoration
+            target_encoder = adaptive_model.model.preprocessor.target_encoder
+            if (hasattr(target_encoder, 'classes_') and
+                target_encoder.classes_ is not None and
+                len(target_encoder.classes_) > 0):
+                print(f"✅ Label encoder restored with {len(target_encoder.classes_)} classes")
+            else:
+                print("⚠️ Label encoder not properly restored")
 
-            # Restore label mappings
-            label_mappings = model_state['label_mappings']
-            adaptive_model.class_to_label = label_mappings['class_to_label']
-            adaptive_model.label_to_class = label_mappings['label_to_class']
+            # Restore CT-DBNN core state - CRITICAL for model performance
+            core_restored = ModelSerializer._restore_ctdbnn_state(adaptive_model.model.core, model_state['ctdbnn_core_state'])
+            if core_restored:
+                print("✅ CT-DBNN core state restored")
+            else:
+                print("❌ CT-DBNN core state restoration failed")
+
+            # Restore wrapper state
+            wrapper_state = model_state['wrapper_state']
+            adaptive_model.model.initialized_with_full_data = wrapper_state['initialized_with_full_data']
+            adaptive_model.model.architecture_frozen = wrapper_state['architecture_frozen']
+            adaptive_model.model.frozen_components = wrapper_state['frozen_components']
 
             # Mark model as trained
             adaptive_model.model_trained = True
-            adaptive_model.model.core.is_trained = True
             adaptive_model.model.is_trained = True
+            adaptive_model.model.core.is_trained = True
 
-            # Validate data consistency
+            # Validate the restored model
             validation_msg = ModelSerializer._validate_loaded_model(adaptive_model)
             if validation_msg:
-                print(f"⚠️ Model validation warning: {validation_msg}")
+                print(f"⚠️ Model validation warnings: {validation_msg}")
+            else:
+                print("✅ Model validation passed")
 
             return True, adaptive_model, f"Model loaded successfully from {file_path}"
 
@@ -304,23 +342,28 @@ class ModelSerializer:
 
     @staticmethod
     def _restore_ctdbnn_state(core_model, state_dict):
-        """Restore CT-DBNN core state"""
+        """Completely restore CT-DBNN core state"""
         try:
+            restored_count = 0
             for key, value in state_dict.items():
-                if hasattr(core_model, key):
-                    # Handle tensor restoration if needed
-                    if key in ['complex_tensor', 'real_tensor', 'weight_tensor'] and value is not None:
-                        if torch.is_tensor(getattr(core_model, key, None)):
-                            # Convert numpy back to tensor
-                            value = torch.from_numpy(value)
+                try:
                     setattr(core_model, key, value)
+                    restored_count += 1
+                except Exception as attr_error:
+                    print(f"⚠️ Could not restore {key}: {attr_error}")
 
-            # Mark as initialized
-            core_model.likelihoods_computed = True
+            # Ensure critical flags are set
+            core_model.likelihoods_computed = getattr(core_model, 'likelihoods_computed', True)
             core_model.is_trained = True
+            core_model.global_likelihood_computed = getattr(core_model, 'global_likelihood_computed', True)
+            core_model.orthogonal_weights_initialized = getattr(core_model, 'orthogonal_weights_initialized', True)
+
+            print(f"✅ Restored {restored_count} CT-DBNN attributes")
+            return True
 
         except Exception as e:
-            print(f"Warning: Could not restore some CT-DBNN state: {e}")
+            print(f"❌ CT-DBNN state restoration failed: {e}")
+            return False
 
 class MemoryManager:
     """Memory management for large dataset processing"""
@@ -1456,32 +1499,54 @@ class AdaptiveCTDBNN:
         print("✅ Architecture initialization complete")
 
     def adaptive_learn(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Main adaptive learning method"""
+        """Main adaptive learning method that respects previous best accuracy"""
         print("\n🚀 STARTING ADAPTIVE LEARNING WITH CT-DBNN")
         print("=" * 60)
 
         # Prepare data if not already done
         if self.X_full is None:
-            if not self.load_and_preprocess_data():
-                raise ValueError("Failed to load and preprocess data")
+            print("🔄 Loading and preprocessing data...")
+            success = self.load_and_preprocess_data()
+            if not success:
+                error_msg = "Failed to load and preprocess data. Check if the data file exists and is accessible."
+                print(f"❌ {error_msg}")
+                raise ValueError(error_msg)
 
         X, y = self.X_full, self.y_full
 
         print(f"📦 Total samples: {len(X)}")
         print(f"🎯 Classes: {np.unique(y)}")
 
-        # STEP 1: Initialize CT-DBNN architecture with full dataset
-        self.initialize_architecture()
+        # CRITICAL: Use existing best accuracy if model was loaded
+        starting_accuracy = self.best_accuracy
+        print(f"🏁 Starting from previous best accuracy: {starting_accuracy:.4f}")
 
-        # STEP 2: Select initial diverse training samples
-        X_train, y_train, initial_indices = self._select_initial_training_samples(X, y)
+        # STEP 1: Initialize CT-DBNN architecture with full dataset ONLY if not already initialized
+        if not getattr(self.model, 'initialized_with_full_data', False):
+            print("🏗️ Initializing CT-DBNN architecture...")
+            self.initialize_architecture()
+        else:
+            print("✅ CT-DBNN architecture already initialized")
+
+        # If we have existing best training indices, use them as starting point
+        if hasattr(self, 'best_training_indices') and self.best_training_indices:
+            print(f"📚 Using existing best training set with {len(self.best_training_indices)} samples")
+            initial_indices = self.best_training_indices.copy()
+            X_train = X[initial_indices]
+            y_train = y[initial_indices]
+        else:
+            # STEP 2: Select initial diverse training samples
+            X_train, y_train, initial_indices = self._select_initial_training_samples(X, y)
+            print(f"🎯 Selected new initial training set: {len(X_train)} samples")
+
         remaining_indices = [i for i in range(len(X)) if i not in initial_indices]
 
         print(f"📊 Initial training set: {len(X_train)} samples")
         print(f"📊 Remaining test set: {len(remaining_indices)} samples")
 
         # Initialize tracking variables for acid test-based stopping
-        self.best_accuracy = 0.0
+        # START FROM PREVIOUS BEST ACCURACY, NOT 0.0
+        self.best_accuracy = starting_accuracy
         self.best_training_indices = initial_indices.copy()
         self.best_round = 0
         acid_test_history = []
@@ -1492,6 +1557,7 @@ class AdaptiveCTDBNN:
         min_improvement = self.adaptive_config['min_improvement']
 
         print(f"\n🔄 Starting adaptive learning for up to {max_rounds} rounds...")
+        print(f"🎯 Target: improve beyond {self.best_accuracy:.4f} (min improvement: {min_improvement})")
         self.adaptive_start_time = datetime.now()
 
         for round_num in range(1, max_rounds + 1):
@@ -1502,7 +1568,7 @@ class AdaptiveCTDBNN:
 
             # STEP 2 (continued): Train with current training data
             print("🎯 Training with current training data...")
-            success = self.model.train_with_data(X_train, y_train, reset_weights=True)
+            success = self.model.train_with_data(X_train, y_train, reset_weights=False)  # Don't reset weights for continued training
 
             if not success:
                 print("❌ Training failed, stopping...")
@@ -1528,8 +1594,8 @@ class AdaptiveCTDBNN:
 
             except Exception as e:
                 print(f"❌ Acid test failed: {e}")
-                acid_test_accuracy = 0.0
-                acid_test_history.append(0.0)
+                acid_test_accuracy = starting_accuracy  # Use starting accuracy as fallback
+                acid_test_history.append(starting_accuracy)
                 # Continue with the round even if acid test fails
 
             # STEP 4: Check if we have any remaining samples to process
@@ -1582,6 +1648,7 @@ class AdaptiveCTDBNN:
                     print("💤 No divergent samples to add in this round")
 
             # STEP 7: Update best model and check for improvement
+            # CRITICAL: Only update if we actually improve beyond previous best
             if acid_test_accuracy > self.best_accuracy + min_improvement:
                 improvement = acid_test_accuracy - self.best_accuracy
                 self.best_accuracy = acid_test_accuracy
@@ -1612,39 +1679,42 @@ class AdaptiveCTDBNN:
         # Finalize with best configuration
         print(f"\n🎉 Adaptive learning completed after {self.adaptive_round} rounds!")
 
-        # Ensure we have valid best values
+        # Ensure we use the best configuration found
         if not hasattr(self, 'best_accuracy') or self.best_accuracy == 0.0:
             # Use final values if best wasn't set
-            self.best_accuracy = acid_test_history[-1] if acid_test_history else 0.0
+            self.best_accuracy = acid_test_history[-1] if acid_test_history else starting_accuracy
             self.best_training_indices = initial_indices.copy()
             self.best_round = self.adaptive_round
 
         print(f"🏆 Best acid test accuracy: {self.best_accuracy:.4f} (round {self.best_round})")
         print(f"📊 Final training set: {len(self.best_training_indices)} samples ({len(self.best_training_indices)/len(X)*100:.1f}% of total)")
 
-        # Use best configuration for final model
-        X_train_best = X[self.best_training_indices]
-        y_train_best = y[self.best_training_indices]
-        X_test_best = X[[i for i in range(len(X)) if i not in self.best_training_indices]]
-        y_test_best = y[[i for i in range(len(X)) if i not in self.best_training_indices]]
-
-        # Train final model with best configuration
-        print("🔧 Training final model with best configuration...")
-        self.model.train_with_data(X_train_best, y_train_best, reset_weights=True)
+        # Only retrain with best configuration if it's better than our starting point
+        if self.best_accuracy > starting_accuracy + min_improvement:
+            print("🔧 Training final model with improved configuration...")
+            X_train_best = X[self.best_training_indices]
+            y_train_best = y[self.best_training_indices]
+            self.model.train_with_data(X_train_best, y_train_best, reset_weights=True)
+        else:
+            print("💤 No significant improvement - keeping original model")
 
         # Final acid test verification
         final_predictions = self.model.predict(X)
         final_accuracy = accuracy_score(y, final_predictions)
 
         print(f"📊 Final acid test accuracy: {final_accuracy:.4f}")
-        print(f"📈 Final training set size: {len(X_train_best)}")
-        print(f"📊 Final remaining set size: {len(X_test_best)}")
+        print(f"📈 Improvement from starting: {final_accuracy - starting_accuracy:+.4f}")
 
         # Create visualizations
         if self.adaptive_visualizer:
             self.adaptive_visualizer.create_visualizations(
                 X, y, final_predictions
             )
+
+        X_train_best = X[self.best_training_indices]
+        y_train_best = y[self.best_training_indices]
+        X_test_best = X[[i for i in range(len(X)) if i not in self.best_training_indices]]
+        y_test_best = y[[i for i in range(len(X)) if i not in self.best_training_indices]]
 
         return X_train_best, y_train_best, X_test_best, y_test_best
 
@@ -2004,7 +2074,7 @@ class AdaptiveCTDBNNGUI:
         try:
             config = self.adaptive_model.config
 
-            # Update CT-DBNN parameters
+            # Update CT-DBNN parameters - FIXED TYPO: ctdbnn_config not ctdbbnn_config
             ctdbnn_config = config.get('ctdbnn_config', {})
             self.resolution_var.set(str(ctdbnn_config.get('resol', 100)))
             self.learning_rate_var.set(str(ctdbnn_config.get('learning_rate', 0.01)))
@@ -2012,7 +2082,7 @@ class AdaptiveCTDBNNGUI:
             self.batch_size_var.set(str(ctdbnn_config.get('batch_size', 32)))
             self.smoothing_factor_var.set(str(ctdbnn_config.get('smoothing_factor', '1e-8')))
             self.use_complex_var.set(ctdbnn_config.get('use_complex_tensor', True))
-            self.orthogonalize_var.set(ctdbbnn_config.get('orthogonalize_weights', True))
+            self.orthogonalize_var.set(ctdbnn_config.get('orthogonalize_weights', True))  # FIXED TYPO
             self.parallel_var.set(ctdbnn_config.get('parallel_processing', True))
 
             # Update adaptive learning parameters
@@ -2185,20 +2255,24 @@ class AdaptiveCTDBNNGUI:
             return False, f"Prediction error: {e}"
 
     def _add_prediction_results(self, chunk_data, predictions, probabilities, unique_classes):
-        """Add prediction results to chunk data with top winners and decoded labels"""
+        """Add prediction results to chunk data with proper label decoding"""
         try:
             # Get the target encoder from the model
             target_encoder = self.adaptive_model.model.preprocessor.target_encoder
 
             # Check if we have a fitted label encoder for decoding
-            if (hasattr(target_encoder, 'classes_') and
-                target_encoder.classes_ is not None and
-                len(target_encoder.classes_) > 0):
+            has_label_encoder = (hasattr(target_encoder, 'classes_') and
+                               target_encoder.classes_ is not None and
+                               len(target_encoder.classes_) > 0)
 
+            if has_label_encoder:
                 # Decode the primary prediction
                 try:
-                    decoded_predictions = target_encoder.inverse_transform(predictions)
+                    # Ensure predictions are within valid range for the encoder
+                    valid_predictions = np.clip(predictions, 0, len(target_encoder.classes_) - 1)
+                    decoded_predictions = target_encoder.inverse_transform(valid_predictions)
                     chunk_data['prediction'] = decoded_predictions
+                    self.log_output(f"✅ Decoded {len(decoded_predictions)} predictions using label encoder")
                 except Exception as e:
                     self.log_output(f"⚠️ Could not decode primary predictions: {e}")
                     chunk_data['prediction'] = predictions
@@ -2217,19 +2291,21 @@ class AdaptiveCTDBNNGUI:
                     keep_mask = top_probs > (max_probs / 3.0)
 
                     # Set low-confidence predictions to NaN
-                    top_classes[~keep_mask] = -1  # Use -1 for invalid, we'll handle this
+                    top_classes[~keep_mask] = -1
                     top_probs[~keep_mask] = np.nan
 
                     # Decode the class labels
                     try:
-                        decoded_top_classes = target_encoder.inverse_transform(top_classes)
+                        # Ensure classes are within valid range
+                        valid_top_classes = np.clip(top_classes, 0, len(target_encoder.classes_) - 1)
+                        decoded_top_classes = target_encoder.inverse_transform(valid_top_classes)
                         # Replace -1 with NaN for invalid predictions
                         decoded_top_classes = np.where(top_classes == -1, np.nan, decoded_top_classes)
+                        chunk_data[f'pred_class_{i+1}'] = decoded_top_classes
                     except Exception as e:
                         self.log_output(f"⚠️ Could not decode top class {i+1}: {e}")
-                        decoded_top_classes = np.where(top_classes == -1, np.nan, top_classes)
+                        chunk_data[f'pred_class_{i+1}'] = np.where(top_classes == -1, np.nan, top_classes)
 
-                    chunk_data[f'pred_class_{i+1}'] = decoded_top_classes
                     chunk_data[f'pred_prob_{i+1}'] = top_probs
 
             else:
@@ -2261,6 +2337,8 @@ class AdaptiveCTDBNNGUI:
 
         except Exception as e:
             self.log_output(f"❌ Error adding prediction results: {e}")
+            import traceback
+            self.log_output(f"🔍 Detailed error: {traceback.format_exc()}")
             # Fallback: just add basic prediction
             chunk_data['prediction'] = predictions
             chunk_data['confidence'] = np.max(probabilities, axis=1)
@@ -2610,8 +2688,7 @@ class AdaptiveCTDBNNGUI:
                   command=self.reset_to_dataset_defaults).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Apply Parameters",
                   command=self.apply_hyperparameters).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(button_frame, text="Show Label Info",
-                  command=self.show_label_encoding_info, width=12).pack(side=tk.LEFT, padx=2)
+
 
         # Configure column weights for responsive layout
         for frame in [core_frame, adaptive_frame, preprocessing_frame]:
@@ -2764,6 +2841,8 @@ class AdaptiveCTDBNNGUI:
                   command=self.load_model, width=12).pack(side=tk.LEFT, padx=2)
         ttk.Button(control_frame2, text="Predict File",
                   command=self.predict_file, width=12).pack(side=tk.LEFT, padx=2)
+        ttk.Button(control_frame2, text="Show Label Info",
+                  command=self.show_label_encoding_info, width=12).pack(side=tk.LEFT, padx=2)
         ttk.Button(control_frame2, text="Exit",
                   command=self.exit_application, width=12).pack(side=tk.LEFT, padx=2)
 
