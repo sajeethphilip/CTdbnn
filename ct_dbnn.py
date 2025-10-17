@@ -1846,9 +1846,13 @@ class EnhancedGUI:
             self.log_message(f"❌ Error training model: {str(e)}")
 
     def evaluate_model(self):
-        """Evaluate the model"""
+        """Evaluate the model - UPDATED to handle no test split"""
         if not self.model or not self.model.is_trained:
             messagebox.showwarning("Warning", "Please train a model first")
+            return
+
+        if self.X_test is None or self.y_test is None:
+            messagebox.showwarning("Warning", "No test data available. Please enable train/test split during initialization.")
             return
 
         try:
@@ -1857,17 +1861,24 @@ class EnhancedGUI:
             self.log_message(f"✅ Evaluation completed")
             self.log_message(f"🎯 Test accuracy: {accuracy:.3f}")
 
-            # Update results tab
             self.results_text.config(state='normal')
             self.results_text.delete('1.0', tk.END)
+
+            if hasattr(self.model, 'training_history') and 'train_accuracy' in self.model.training_history:
+                train_acc = self.model.training_history['train_accuracy']
+            else:
+                train_acc = "N/A"
+
             results_summary = f"""MODEL EVALUATION RESULTS
     {'='*40}
     Dataset: {self.model.model_metadata['data_name']}
-    Training Accuracy: {self.model.training_history['train_accuracy']:.3f}
+    Training Accuracy: {train_acc}
     Test Accuracy: {accuracy:.3f}
     Training Time: {self.model.training_history['training_time']:.2f}s
     Features: {self.model.innodes}
     Classes: {self.model.outnodes}
+    Training Samples: {len(self.X_train)}
+    Test Samples: {len(self.X_test)}
     """
             self.results_text.insert('1.0', results_summary)
             self.results_text.config(state='disabled')
@@ -2272,9 +2283,35 @@ class EnhancedGUI:
                   command=self.auto_load_parameters).pack(side='left', padx=(10, 0))
 
     def create_training_tab(self, parent):
-        """Create training interface tab"""
+        """Create training interface tab with configurable train/test split"""
         main_frame = ttk.Frame(parent)
         main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # Training configuration frame
+        config_frame = ttk.LabelFrame(main_frame, text="Training Configuration", padding=10)
+        config_frame.pack(fill='x', pady=(0, 10))
+
+        # Train/test split configuration
+        split_frame = ttk.Frame(config_frame)
+        split_frame.pack(fill='x', pady=5)
+
+        self.enable_split_var = tk.BooleanVar(value=False)
+        self.split_checkbox = ttk.Checkbutton(split_frame, text="Enable Train/Test Split",
+                                             variable=self.enable_split_var,
+                                             command=self.toggle_split_config)
+        self.split_checkbox.pack(side='left', padx=(0, 20))
+
+        self.split_label = ttk.Label(split_frame, text="Training Percentage:")
+        self.split_label.pack(side='left', padx=(0, 10))
+
+        self.train_split_var = tk.DoubleVar(value=80.0)
+        self.train_split_spin = ttk.Spinbox(split_frame, from_=10, to=100, increment=5,
+                                           textvariable=self.train_split_var, width=5,
+                                           state='disabled')
+        self.train_split_spin.pack(side='left', padx=(0, 10))
+
+        self.percent_label = ttk.Label(split_frame, text="%")
+        self.percent_label.pack(side='left')
 
         # Training controls
         control_frame = ttk.Frame(main_frame)
@@ -2307,6 +2344,18 @@ class EnhancedGUI:
         self.log_text = scrolledtext.ScrolledText(log_frame, height=15)
         self.log_text.pack(fill='both', expand=True)
         self.log_text.config(state='disabled')
+
+    def toggle_split_config(self):
+        """Enable/disable train split configuration based on checkbox"""
+        if self.enable_split_var.get():
+            self.train_split_spin.config(state='normal')
+            self.split_label.config(foreground='black')
+            self.percent_label.config(foreground='black')
+        else:
+            self.train_split_spin.config(state='disabled')
+            self.split_label.config(foreground='gray')
+            self.percent_label.config(foreground='gray')
+
 
     def create_prediction_tab(self, parent):
         """Create prediction interface tab"""
@@ -2607,13 +2656,13 @@ Top 5 Predictions (by confidence):
             self.log_message(f"✅ Feature names set to: {feature_names}")
 
     def initialize_model(self):
-        """Initialize model with current parameters and feature selection - FIXED to use actual feature names"""
+        """Initialize model with current parameters and feature selection - UPDATED with optional split"""
         if not hasattr(self, 'current_dataset'):
             messagebox.showwarning("Warning", "Please load a dataset first")
             return
 
         try:
-            self.apply_parameters()  # Ensure parameters are applied
+            self.apply_parameters()
 
             # Apply feature selection if specified
             if self.feature_selection:
@@ -2621,51 +2670,67 @@ Top 5 Predictions (by confidence):
                 target_column = self.feature_selection['target']
 
                 if hasattr(self.current_dataset, 'columns'):
-                    # For CSV data
                     df = pd.read_csv(self.current_csv_path)
                     features_df = df[selected_features]
                     targets = df[target_column]
 
-                    # Split data
-                    self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
-                        features_df.values, targets.values, test_size=0.2, random_state=42, stratify=targets
-                    )
+                    if self.enable_split_var.get():
+                        test_size = (100 - self.train_split_var.get()) / 100.0
+                        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+                            features_df.values, targets.values,
+                            test_size=test_size,
+                            random_state=42,
+                            stratify=targets
+                        )
+                        self.log_message(f"✅ Data split: {self.train_split_var.get()}% training, {100-self.train_split_var.get()}% testing")
+                        self.log_message(f"   Training samples: {len(self.X_train)}")
+                        self.log_message(f"   Testing samples: {len(self.X_test)}")
+                    else:
+                        self.X_train = features_df.values
+                        self.y_train = targets.values
+                        self.X_test = None
+                        self.y_test = None
+                        self.log_message("✅ Using 100% of data for training (no test split)")
+                        self.log_message(f"   Training samples: {len(self.X_train)}")
 
                     self.model = ParallelCTDBNN(self.model_config)
-
-                    # CRITICAL FIX: Pass actual feature names to compute_global_likelihoods
                     self.model.compute_global_likelihoods(self.X_train, self.y_train, selected_features)
-
                     self.model.selected_features = selected_features
                     self.model.target_column_name = target_column
 
-                    self.log_message("✅ Model initialized with feature selection")
-                    self.log_message(f"   Features: {len(selected_features)}")
-                    self.log_message(f"   Target: {target_column}")
-                    self.log_message(f"   Feature names: {selected_features}")
                 else:
                     messagebox.showwarning("Warning", "Feature selection only available for CSV files")
                     return
             else:
-                # Use all features (fallback)
                 if hasattr(self.current_dataset, 'data'):
                     features = self.current_dataset.data
                     targets = getattr(self.current_dataset, 'target', None)
 
-                    # CRITICAL FIX: Get actual feature names from the dataset
                     feature_names = getattr(self.current_dataset, 'feature_names', None)
                     if feature_names is None and hasattr(self.current_dataset, 'columns'):
-                        # Use all columns except target
-                        feature_names = [col for col in self.current_dataset.columns if col != 'target']  # Adjust target name
+                        feature_names = [col for col in self.current_dataset.columns if col != 'target']
 
                     if targets is not None:
-                        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
-                            features, targets, test_size=0.2, random_state=42, stratify=targets
-                        )
+                        if self.enable_split_var.get():
+                            test_size = (100 - self.train_split_var.get()) / 100.0
+                            self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(
+                                features, targets,
+                                test_size=test_size,
+                                random_state=42,
+                                stratify=targets
+                            )
+                            self.log_message(f"✅ Data split: {self.train_split_var.get()}% training, {100-self.train_split_var.get()}% testing")
+                            self.log_message(f"   Training samples: {len(self.X_train)}")
+                            self.log_message(f"   Testing samples: {len(self.X_test)}")
+                        else:
+                            self.X_train = features
+                            self.y_train = targets
+                            self.X_test = None
+                            self.y_test = None
+                            self.log_message("✅ Using 100% of data for training (no test split)")
+                            self.log_message(f"   Training samples: {len(self.X_train)}")
 
                         self.model = ParallelCTDBNN(self.model_config)
-
-                        # CRITICAL FIX: Pass actual feature names
                         self.model.compute_global_likelihoods(self.X_train, self.y_train, feature_names)
 
                     else:
@@ -2680,6 +2745,7 @@ Top 5 Predictions (by confidence):
         except Exception as e:
             messagebox.showerror("Error", f"Failed to initialize model: {str(e)}")
             self.log_message(f"❌ Error initializing model: {str(e)}")
+
     def run(self):
         """Run the GUI application"""
         if GUI_AVAILABLE:
@@ -2689,7 +2755,7 @@ Top 5 Predictions (by confidence):
 
 
 def main():
-    """Main function with command-line interface"""
+    """Main function with command-line interface - UPDATED with optional split"""
     parser = argparse.ArgumentParser(
         description="Enhanced CT-DBNN Classifier with Comprehensive Prediction System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2698,23 +2764,20 @@ Examples:
   # Run with GUI
   python ct_dbnn_enhanced.py --gui
 
-  # Train on Iris dataset
+  # Train on Iris dataset with no test split (use all data for training)
   python ct_dbnn_enhanced.py --dataset iris --train
 
-  # Train with custom parameters and feature selection
-  python ct_dbnn_enhanced.py --csv data.csv --features col1,col2,col3 --target outcome --train
+  # Train with 80% training data, 20% testing
+  python ct_dbnn_enhanced.py --dataset iris --train --train-split 80
+
+  # Train with custom parameters and no test split
+  python ct_dbnn_enhanced.py --csv data.csv --features col1,col2,col3 --target outcome --train --no-split
 
   # Load and evaluate model
   python ct_dbnn_enhanced.py --load-model model.pkl --evaluate
 
   # Predict on new data
   python ct_dbnn_enhanced.py --load-model model.pkl --predict new_data.csv
-
-  # Predict with specific features
-  python ct_dbnn_enhanced.py --load-model model.pkl --predict new_data.csv --features col1,col2,col3
-
-  # Predict ignoring target column
-  python ct_dbnn_enhanced.py --load-model model.pkl --predict new_data.csv --has-target --target-col outcome
         """
     )
 
@@ -2740,15 +2803,20 @@ Examples:
     model_group.add_argument('--n-jobs', type=int, default=-1,
                            help='Number of parallel jobs (default: -1 for all)')
 
+    # Training options
+    training_group = parser.add_argument_group('Training Options')
+    training_group.add_argument('--train', action='store_true', help='Train model on dataset')
+    training_group.add_argument('--no-split', action='store_true',
+                               help='Use all data for training (no test split)')
+    training_group.add_argument('--train-split', type=float, default=80,
+                               help='Percentage of data to use for training (default: 80)')
+    training_group.add_argument('--evaluate', action='store_true',
+                               help='Evaluate model on test set (requires train/test split)')
+
     # Operation modes
     operation_group = parser.add_argument_group('Operation Modes')
     operation_group.add_argument('--gui', action='store_true',
                                help='Launch GUI interface')
-    operation_group.add_argument('--train', action='store_true',
-                               help='Train model on dataset')
-    operation_group.add_argument('--evaluate', action='store_true',
-                               help='Evaluate model on test set')
-    operation_group.add_argument('--predict', help='Run prediction on specified file')
     operation_group.add_argument('--load-model', help='Load model from file')
     operation_group.add_argument('--save-model', help='Save model to file')
     operation_group.add_argument('--save-hp', help='Save hyperparameters to JSON file')
@@ -2756,13 +2824,12 @@ Examples:
 
     # Prediction options
     pred_group = parser.add_argument_group('Prediction Options')
+    pred_group.add_argument('--predict', help='Run prediction on specified file')
     pred_group.add_argument('--has-target', action='store_true',
                           help='Input file has target column (will be ignored for prediction)')
     pred_group.add_argument('--target-col', help='Target column name in prediction file')
 
     # Additional options
-    parser.add_argument('--test-split', type=float, default=0.2,
-                       help='Test split ratio (default: 0.2)')
     parser.add_argument('--random-state', type=int, default=42,
                        help='Random state for reproducibility (default: 42)')
 
@@ -2787,12 +2854,10 @@ Examples:
         model = ParallelCTDBNN()
         model.load_model(args.load_model)
 
-        # Parse features
         features_to_use = None
         if args.features:
             features_to_use = [f.strip() for f in args.features.split(',')]
 
-        # Run prediction
         try:
             results_df = model.predict_on_file(
                 filepath=args.predict,
@@ -2806,15 +2871,17 @@ Examples:
             print(f"❌ Prediction failed: {e}")
             return 1
 
-    # Command-line mode - Training
+    # Command-line mode - Load existing model
     if args.load_model:
-        # Load existing model
         model = ParallelCTDBNN()
         model.load_model(args.load_model)
 
-        if args.evaluate and hasattr(model, 'X_test'):
-            accuracy = model.evaluate(model.X_test, model.y_test)
-            print(f"Test accuracy: {accuracy:.3f}")
+        if args.evaluate:
+            if hasattr(model, 'X_test') and model.X_test is not None:
+                accuracy = model.evaluate(model.X_test, model.y_test)
+                print(f"Test accuracy: {accuracy:.3f}")
+            else:
+                print("❌ Cannot evaluate: No test data available in loaded model")
 
         if args.save_model:
             model.save_model(args.save_model)
@@ -2823,7 +2890,6 @@ Examples:
 
     # Training mode
     if args.dataset or args.csv:
-        # Prepare configuration
         config = {
             'resol': args.resol,
             'use_complex_tensor': not args.no_complex_tensor,
@@ -2843,14 +2909,12 @@ Examples:
             elif args.dataset == "breast_cancer":
                 data = load_breast_cancer()
             elif args.dataset == "diabetes":
-                # Load from UCI
                 info = UCI_DATASETS["diabetes"]
                 df = UCIDatasetLoader.download_uci_data(info)
                 data = type('DiabetesData', (), {})()
                 data.data = df.iloc[:, :-1].values
                 data.target = df.iloc[:, -1].values
             else:
-                # Try to fetch custom UCI dataset
                 info = UCIDatasetLoader.load_any_uci_dataset(args.dataset)
                 if info:
                     df = UCIDatasetLoader.download_uci_data(info)
@@ -2876,37 +2940,43 @@ Examples:
             print(f"Loading CSV: {args.csv}")
             df = pd.read_csv(args.csv)
 
-            # Feature selection
             if args.features:
                 features_to_use = [f.strip() for f in args.features.split(',')]
-                # Verify features exist
                 missing_features = [f for f in features_to_use if f not in df.columns]
                 if missing_features:
                     print(f"❌ Missing features: {missing_features}")
                     return 1
                 features = df[features_to_use].values
             else:
-                # Use all features except target
                 features_to_use = [col for col in df.columns if col != args.target]
                 features = df[features_to_use].values
 
             targets = df[args.target].values
-
-            # Store feature names for later use
             feature_names = features_to_use if args.features else [col for col in df.columns if col != args.target]
 
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            features, targets,
-            test_size=args.test_split,
-            random_state=args.random_state,
-            stratify=targets
-        )
+        # Handle train/test split based on arguments
+        if args.no_split:
+            X_train = features
+            y_train = targets
+            X_test = None
+            y_test = None
+            print("✅ Using 100% of data for training (no test split)")
+            print(f"   Training samples: {len(X_train)}")
+        else:
+            test_size = (100 - args.train_split) / 100.0
+            X_train, X_test, y_train, y_test = train_test_split(
+                features, targets,
+                test_size=test_size,
+                random_state=args.random_state,
+                stratify=targets
+            )
+            print(f"✅ Data split: {args.train_split}% training, {100-args.train_split}% testing")
+            print(f"   Training samples: {len(X_train)}")
+            print(f"   Testing samples: {len(X_test)}")
 
         # Initialize and train model
         model = ParallelCTDBNN(config)
 
-        # Set feature names if available
         if 'feature_names' in locals():
             model.feature_names = feature_names
             model.selected_features = feature_names
@@ -2920,8 +2990,11 @@ Examples:
             model.train(X_train, y_train)
 
             if args.evaluate:
-                accuracy = model.evaluate(X_test, y_test)
-                print(f"Test accuracy: {accuracy:.3f}")
+                if X_test is not None and y_test is not None:
+                    accuracy = model.evaluate(X_test, y_test)
+                    print(f"Test accuracy: {accuracy:.3f}")
+                else:
+                    print("❌ Cannot evaluate: No test data available (use --train-split instead of --no-split)")
 
         if args.save_model:
             model.save_model(args.save_model)
@@ -2938,7 +3011,6 @@ Examples:
         parser.print_help()
 
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
