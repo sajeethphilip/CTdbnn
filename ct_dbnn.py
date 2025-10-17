@@ -37,6 +37,7 @@ try:
     import matplotlib
     matplotlib.use('TkAgg')
     GUI_AVAILABLE = True
+    from ct_dbnn_gui import EnhancedGUI
 except ImportError:
     GUI_AVAILABLE = False
 
@@ -222,7 +223,7 @@ class DataPreprocessor:
     def fit_transform_features(self, features, feature_names=None):
         """Fit and transform features with label encoding and missing value handling"""
         if isinstance(features, pd.DataFrame):
-            # ALWAYS use DataFrame column names
+            # ALWAYS use DataFrame column names - PRESERVE ORIGINAL NAMES
             self.feature_columns = list(features.columns)
             print(f"🔧 Using DataFrame column names: {self.feature_columns}")
             result = self._fit_transform_dataframe(features)
@@ -240,9 +241,13 @@ class DataPreprocessor:
                 elif hasattr(features, 'feature_names'):
                     self.feature_columns = features.feature_names
                     print(f"🔧 Using data.feature_names: {self.feature_columns}")
+                elif hasattr(features, 'feature_names_in_'):
+                    # For newer sklearn datasets
+                    self.feature_columns = list(features.feature_names_in_)
+                    print(f"🔧 Using data.feature_names_in_: {self.feature_columns}")
                 else:
                     # LAST RESORT: Use descriptive names that indicate source
-                    self.feature_columns = [f'Column_{i+1}' for i in range(n_features)]
+                    self.feature_columns = [f'Feature_{i+1}' for i in range(n_features)]
                     print(f"⚠️  No feature names found. Using: {self.feature_columns}")
             result = self._fit_transform_array(features)
         else:
@@ -253,7 +258,7 @@ class DataPreprocessor:
                 print(f"🔧 Using provided feature names: {self.feature_columns}")
             else:
                 n_features = features_array.shape[1]
-                self.feature_columns = [f'Column_{i+1}' for i in range(n_features)]
+                self.feature_columns = [f'Feature_{i+1}' for i in range(n_features)]
                 print(f"⚠️  No feature names provided. Using: {self.feature_columns}")
             result = self._fit_transform_array(features_array)
 
@@ -349,24 +354,22 @@ class DataPreprocessor:
             return self._transform_array(features_array)
 
     def _transform_dataframe(self, df):
-        """Transform DataFrame features using fitted encoders - USE ORIGINAL COLUMN NAMES"""
+        """Transform DataFrame features using fitted encoders - USE EXACT TRAINING COLUMN NAMES AND ORDER"""
         processed_data = df.copy()
 
         # CRITICAL: Check if all required columns are present
         missing_columns = []
-        for fitted_col in self.feature_encoders.keys():
+        for fitted_col in self.feature_columns:  # Use stored feature columns in training order
             if fitted_col not in df.columns:
                 missing_columns.append(fitted_col)
 
         if missing_columns:
             raise ValueError(f"Missing columns in prediction data: {missing_columns}. "
                            f"Available columns: {list(df.columns)}. "
-                           f"Expected columns: {list(self.feature_encoders.keys())}")
+                           f"Expected columns (in training order): {self.feature_columns}")
 
-        for col in self.feature_encoders.keys():  # Only process columns that were fitted
-            if col not in df.columns:
-                continue
-
+        # Process only the columns that were fitted, in the exact training order
+        for col in self.feature_columns:
             # Handle missing values
             if df[col].isna().any():
                 processed_data[col] = df[col].fillna(self.missing_value_placeholder)
@@ -378,7 +381,7 @@ class DataPreprocessor:
                     lambda x: encoder.get(x, 0) if x in encoder else 0
                 )
 
-        # Ensure we return only the columns that were fitted, in the correct order
+        # Ensure we return only the columns that were fitted, in the CORRECT TRAINING ORDER
         processed_data = processed_data[self.feature_columns]
         return processed_data.values.astype(np.float64)
 
@@ -587,180 +590,184 @@ class ParallelCTDBNN:
         self.target_column_name = None
 
     def compute_global_likelihoods(self, features, targets, feature_names=None):
-            """
-            Compute global likelihoods ONCE on entire dataset with comprehensive preprocessing
-            This is called ONLY during training - PRESERVES ACTUAL FEATURE NAMES
-            """
-            if self.likelihoods_computed:
-                print("⚠️  Likelihoods already computed! Using existing global likelihoods.")
-                return self.training_features_norm
+        """
+        Compute global likelihoods ONCE on entire dataset with comprehensive preprocessing
+        This is called ONLY during training - PRESERVES ACTUAL FEATURE NAMES
+        """
+        if self.likelihoods_computed:
+            print("⚠️  Likelihoods already computed! Using existing global likelihoods.")
+            return self.training_features_norm
 
-            print("Computing GLOBAL likelihoods on entire dataset...")
-            print("🔧 Applying comprehensive data preprocessing...")
+        print("Computing GLOBAL likelihoods on entire dataset...")
+        print("🔧 Applying comprehensive data preprocessing...")
 
-            # CRITICAL FIX: Extract actual feature names from the data
-            actual_feature_names = None
+        # CRITICAL FIX: Extract actual feature names from the data
+        actual_feature_names = None
 
-            if hasattr(features, 'columns'):
-                # DataFrame with column names
-                actual_feature_names = list(features.columns)
-                print(f"🔧 Using DataFrame column names: {actual_feature_names}")
-            elif feature_names is not None:
-                # Use provided feature names
-                actual_feature_names = feature_names
-                print(f"🔧 Using provided feature names: {actual_feature_names}")
-            elif hasattr(features, 'feature_names'):
-                # Data object with feature_names attribute
-                actual_feature_names = features.feature_names
-                print(f"🔧 Using data.feature_names: {actual_feature_names}")
-            else:
-                # Try to extract from the data structure
-                try:
-                    # For sklearn datasets, they often have feature_names attribute
-                    if hasattr(features, 'feature_names'):
-                        actual_feature_names = features.feature_names
-                        print(f"🔧 Using dataset.feature_names: {actual_feature_names}")
-                    else:
-                        # Last resort: check if we can infer from the data structure
-                        n_features = features.shape[1] if hasattr(features, 'shape') else len(features[0])
-                        actual_feature_names = [f'feature_{i}' for i in range(n_features)]
-                        print(f"⚠️  No feature names found. Using: {actual_feature_names}")
-                except:
-                    n_features = features.shape[1] if hasattr(features, 'shape') else len(features[0])
-                    actual_feature_names = [f'feature_{i}' for i in range(n_features)]
-                    print(f"⚠️  Could not extract feature names. Using: {actual_feature_names}")
-
-            # Preprocess features and targets - PASS ACTUAL FEATURE NAMES
-            features_processed = self.preprocessor.fit_transform_features(features, actual_feature_names)
-            self.training_targets_encoded = self.preprocessor.fit_transform_targets(targets)
-
-            # Store feature names from preprocessor - USE ACTUAL NAMES
-            self.feature_names = self.preprocessor.get_feature_names()
-
-            # Update model metadata with dataset info - USE ACTUAL NAME
-            if hasattr(features, 'name'):
-                self.model_metadata['data_name'] = features.name
-            elif hasattr(targets, 'name'):
-                self.model_metadata['data_name'] = targets.name
-            elif hasattr(self, 'model_metadata') and 'data_name' in self.model_metadata:
-                # Keep existing name if already set
-                pass
-            else:
-                # Use a descriptive name
-                self.model_metadata['data_name'] = f"dataset_{int(time.time())}"
-
-            n_samples, n_features = features_processed.shape
-            self.innodes = n_features
-            resol = self.config['resol']
-
-            print(f"Data shape: {features_processed.shape}, Resolution: {resol}")
-            print(f"✅ ACTUAL Feature names: {self.feature_names}")
-            print(f"Missing values replaced with: {self.config['missing_value_placeholder']}")
-
-            # Step 1: Fit encoder - USE THE SAME ENCODING AS PREPROCESSOR
-            self._fit_encoder_consistent()
-
-            # Initialize global arrays with proper dimensions
-            self.max_val = np.zeros(n_features + 2, dtype=np.float64)
-            self.min_val = np.zeros(n_features + 2, dtype=np.float64)
-            self.resolution_arr = np.zeros(n_features + 8, dtype=np.int32)
-
-            # Initialize binloc with proper dimensions
-            self.binloc = np.zeros((n_features + 2, resol + 8), dtype=np.float64)
-
-            # Compute global min/max (ignoring missing values) - STORE FOR CONSISTENT NORMALIZATION
-            for i in range(n_features):
-                feature_idx = i + 1
-                feature_data = features_processed[:, i]
-
-                # Filter out missing values for min/max calculation
-                valid_mask = feature_data != self.config['missing_value_placeholder']
-                valid_data = feature_data[valid_mask]
-
-                if len(valid_data) > 0:
-                    self.max_val[feature_idx] = np.max(valid_data)
-                    self.min_val[feature_idx] = np.min(valid_data)
+        if hasattr(features, 'columns'):
+            # DataFrame with column names - USE EXACT COLUMN NAMES
+            actual_feature_names = list(features.columns)
+            print(f"🔧 Using DataFrame column names: {actual_feature_names}")
+        elif feature_names is not None:
+            # Use provided feature names
+            actual_feature_names = feature_names
+            print(f"🔧 Using provided feature names: {actual_feature_names}")
+        elif hasattr(features, 'feature_names'):
+            # Data object with feature_names attribute
+            actual_feature_names = features.feature_names
+            print(f"🔧 Using data.feature_names: {actual_feature_names}")
+        elif hasattr(features, 'feature_names_in_'):
+            # For newer sklearn datasets
+            actual_feature_names = list(features.feature_names_in_)
+            print(f"🔧 Using data.feature_names_in_: {actual_feature_names}")
+        else:
+            # Try to extract from the data structure
+            try:
+                # For sklearn datasets, they often have feature_names attribute
+                if hasattr(features, 'feature_names'):
+                    actual_feature_names = features.feature_names
+                    print(f"🔧 Using dataset.feature_names: {actual_feature_names}")
                 else:
-                    self.max_val[feature_idx] = 1.0
-                    self.min_val[feature_idx] = 0.0
+                    # Last resort: check if we can infer from the data structure
+                    n_features = features.shape[1] if hasattr(features, 'shape') else len(features[0])
+                    actual_feature_names = [f'Feature_{i+1}' for i in range(n_features)]
+                    print(f"⚠️  No feature names found. Using: {actual_feature_names}")
+            except:
+                n_features = features.shape[1] if hasattr(features, 'shape') else len(features[0])
+                actual_feature_names = [f'Feature_{i+1}' for i in range(n_features)]
+                print(f"⚠️  Could not extract feature names. Using: {actual_feature_names}")
 
-                self.resolution_arr[feature_idx] = resol
+        # Preprocess features and targets - PASS ACTUAL FEATURE NAMES
+        features_processed = self.preprocessor.fit_transform_features(features, actual_feature_names)
+        self.training_targets_encoded = self.preprocessor.fit_transform_targets(targets)
 
-                # Initialize bin locations
-                for j in range(1, resol + 1):
-                    self.binloc[feature_idx][j] = (j - 1) * 1.0
+        # Store feature names from preprocessor - USE ACTUAL NAMES
+        self.feature_names = self.preprocessor.get_feature_names()
 
-            # Normalize features (missing values remain as placeholder during normalization)
-            # STORE THE NORMALIZED FEATURES FOR CONSISTENT PROCESSING
-            self.training_features_norm = self._normalize_features(features_processed)
+        # Update model metadata with dataset info - USE ACTUAL NAME
+        if hasattr(features, 'name'):
+            self.model_metadata['data_name'] = features.name
+        elif hasattr(targets, 'name'):
+            self.model_metadata['data_name'] = targets.name
+        elif hasattr(self, 'model_metadata') and 'data_name' in self.model_metadata:
+            # Keep existing name if already set
+            pass
+        else:
+            # Use a descriptive name
+            self.model_metadata['data_name'] = f"dataset_{int(time.time())}"
 
-            # Initialize global network counts with proper dimensions
-            self.global_anti_net = np.zeros(
-                (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
-                dtype=np.float64
-            )
+        n_samples, n_features = features_processed.shape
+        self.innodes = n_features
+        resol = self.config['resol']
 
-            # Build global likelihoods (skip samples with too many missing values)
-            total_samples = len(self.training_features_norm)
-            print(f"Building global likelihoods from {total_samples} samples...")
+        print(f"Data shape: {features_processed.shape}, Resolution: {resol}")
+        print(f"✅ ACTUAL Feature names: {self.feature_names}")
+        print(f"Missing values replaced with: {self.config['missing_value_placeholder']}")
 
-            valid_samples = 0
-            for sample_idx in range(total_samples):
-                # Skip samples that are entirely missing values
-                sample_data = self.training_features_norm[sample_idx, :]
-                missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
+        # Step 1: Fit encoder - USE THE SAME ENCODING AS PREPROCESSOR
+        self._fit_encoder_consistent()
 
-                if missing_count >= n_features:  # Skip if all features are missing
+        # Initialize global arrays with proper dimensions
+        self.max_val = np.zeros(n_features + 2, dtype=np.float64)
+        self.min_val = np.zeros(n_features + 2, dtype=np.float64)
+        self.resolution_arr = np.zeros(n_features + 8, dtype=np.int32)
+
+        # Initialize binloc with proper dimensions
+        self.binloc = np.zeros((n_features + 2, resol + 8), dtype=np.float64)
+
+        # Compute global min/max (ignoring missing values) - STORE FOR CONSISTENT NORMALIZATION
+        for i in range(n_features):
+            feature_idx = i + 1
+            feature_data = features_processed[:, i]
+
+            # Filter out missing values for min/max calculation
+            valid_mask = feature_data != self.config['missing_value_placeholder']
+            valid_data = feature_data[valid_mask]
+
+            if len(valid_data) > 0:
+                self.max_val[feature_idx] = np.max(valid_data)
+                self.min_val[feature_idx] = np.min(valid_data)
+            else:
+                self.max_val[feature_idx] = 1.0
+                self.min_val[feature_idx] = 0.0
+
+            self.resolution_arr[feature_idx] = resol
+
+            # Initialize bin locations
+            for j in range(1, resol + 1):
+                self.binloc[feature_idx][j] = (j - 1) * 1.0
+
+        # Normalize features (missing values remain as placeholder during normalization)
+        # STORE THE NORMALIZED FEATURES FOR CONSISTENT PROCESSING
+        self.training_features_norm = self._normalize_features(features_processed)
+
+        # Initialize global network counts with proper dimensions
+        self.global_anti_net = np.zeros(
+            (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
+            dtype=np.float64
+        )
+
+        # Build global likelihoods (skip samples with too many missing values)
+        total_samples = len(self.training_features_norm)
+        print(f"Building global likelihoods from {total_samples} samples...")
+
+        valid_samples = 0
+        for sample_idx in range(total_samples):
+            # Skip samples that are entirely missing values
+            sample_data = self.training_features_norm[sample_idx, :]
+            missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
+
+            if missing_count >= n_features:  # Skip if all features are missing
+                continue
+
+            valid_samples += 1
+            bins = self._find_closest_bins(sample_data)
+
+            for i in range(n_features):
+                feature_i = i + 1
+                bin_i = bins[i] + 1
+
+                # Skip if this feature is missing
+                if self.training_features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
                     continue
 
-                valid_samples += 1
-                bins = self._find_closest_bins(sample_data)
-
-                for i in range(n_features):
-                    feature_i = i + 1
-                    bin_i = bins[i] + 1
+                for l in range(n_features):
+                    feature_l = l + 1
+                    bin_l = bins[l] + 1
 
                     # Skip if this feature is missing
-                    if self.training_features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
+                    if self.training_features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
                         continue
 
-                    for l in range(n_features):
-                        feature_l = l + 1
-                        bin_l = bins[l] + 1
+                    # Find correct class for this sample - USE ENCODED TARGETS
+                    k_class = 1
+                    while (k_class <= self.outnodes and
+                           abs(self.training_targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
+                        k_class += 1
 
-                        # Skip if this feature is missing
-                        if self.training_features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
-                            continue
+                    if k_class <= self.outnodes:
+                        self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
+                        self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
 
-                        # Find correct class for this sample - USE ENCODED TARGETS
-                        k_class = 1
-                        while (k_class <= self.outnodes and
-                               abs(self.training_targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
-                            k_class += 1
+            if sample_idx > 0 and sample_idx % 50 == 0:
+                print(f"  Processed {sample_idx}/{total_samples} samples...")
 
-                        if k_class <= self.outnodes:
-                            self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
-                            self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
+        print(f"✅ Used {valid_samples} valid samples (excluding entirely missing samples)")
 
-                if sample_idx > 0 and sample_idx % 50 == 0:
-                    print(f"  Processed {sample_idx}/{total_samples} samples...")
+        # Apply smoothing
+        smoothing = self.config['smoothing_factor']
+        for i in range(1, n_features + 1):
+            for j in range(1, resol + 1):
+                for l in range(1, n_features + 1):
+                    for m in range(1, resol + 1):
+                        for k in range(1, self.outnodes + 1):
+                            self.global_anti_net[i, j, l, m, k] += smoothing
+                        self.global_anti_net[i, j, l, m, 0] += smoothing * self.outnodes
 
-            print(f"✅ Used {valid_samples} valid samples (excluding entirely missing samples)")
+        self.likelihoods_computed = True
+        print("✅ Global likelihoods computed and fixed")
 
-            # Apply smoothing
-            smoothing = self.config['smoothing_factor']
-            for i in range(1, n_features + 1):
-                for j in range(1, resol + 1):
-                    for l in range(1, n_features + 1):
-                        for m in range(1, resol + 1):
-                            for k in range(1, self.outnodes + 1):
-                                self.global_anti_net[i, j, l, m, k] += smoothing
-                            self.global_anti_net[i, j, l, m, 0] += smoothing * self.outnodes
-
-            self.likelihoods_computed = True
-            print("✅ Global likelihoods computed and fixed")
-
-            return self.training_features_norm
+        return self.training_features_norm
 
     def _fit_encoder_consistent(self):
         """Fit class encoder - CONSISTENT with preprocessor encoding"""
@@ -1237,7 +1244,7 @@ class ParallelCTDBNN:
     def predict_on_file(self, filepath, output_file=None, features_to_use=None, has_target=False, target_column=None):
         """
         Comprehensive prediction on file with feature selection
-        FLEXIBLE FEATURE MATCHING - uses position-based matching if names don't match
+        USES EXACT FEATURE NAMES AND ORDERING FROM TRAINING
         """
         try:
             # Load data
@@ -1247,54 +1254,41 @@ class ParallelCTDBNN:
             print(f"📊 Prediction file columns: {original_columns}")
             print(f"📊 Model feature names: {self.feature_names}")
 
-            # Determine features to use
+            # Determine features to use - ALWAYS USE MODEL'S FEATURE NAMES IN TRAINING ORDER
             if features_to_use is None:
-                if self.selected_features is not None:
-                    features_to_use = self.selected_features
-                else:
-                    features_to_use = self.feature_names if self.feature_names else original_columns
+                features_to_use = self.feature_names  # Use exact feature names from training
 
             # Remove target column if specified
             if target_column and target_column in features_to_use:
                 features_to_use = [f for f in features_to_use if f != target_column]
 
-            # FLEXIBLE FEATURE MATCHING: Try multiple strategies
+            # STRICT FEATURE MATCHING: Use exact feature names and ordering from training
             available_features = []
-            matching_strategy = "exact_names"
+            missing_features = []
 
-            # Strategy 1: Exact name matching
-            for feature in self.feature_names:
+            for feature in features_to_use:
                 if feature in df.columns:
                     available_features.append(feature)
-
-            if len(available_features) == len(self.feature_names):
-                print("✅ All features matched by exact names")
-            else:
-                # Strategy 2: Position-based matching (same number of features)
-                if len(df.columns) >= len(self.feature_names):
-                    available_features = list(df.columns)[:len(self.feature_names)]
-                    matching_strategy = "position_based"
-                    print(f"⚠️  Using position-based matching: {available_features}")
                 else:
-                    # Strategy 3: Use available columns and hope they match
-                    available_features = [col for col in df.columns if col != target_column]
-                    matching_strategy = "available_columns"
-                    print(f"⚠️  Using available columns: {available_features}")
+                    missing_features.append(feature)
 
-            if len(available_features) == 0:
-                raise ValueError("No valid features found for prediction")
+            if missing_features:
+                print(f"❌ Missing features in prediction file: {missing_features}")
+                print(f"   Available features: {df.columns.tolist()}")
+                raise ValueError(f"Missing features in prediction file: {missing_features}")
 
-            # Verify we have the right number of features
-            if len(available_features) != len(self.feature_names):
-                print(f"⚠️  Warning: Number of features doesn't match. Model: {len(self.feature_names)}, File: {len(available_features)}")
-                print(f"    Using first {len(available_features)} features from model: {self.feature_names[:len(available_features)]}")
+            if len(available_features) != len(features_to_use):
+                print(f"❌ Feature count mismatch. Expected: {len(features_to_use)}, Found: {len(available_features)}")
+                raise ValueError(f"Feature count mismatch. Expected: {len(features_to_use)}, Found: {len(available_features)}")
 
-            # Extract features for prediction
+            print(f"✅ All {len(available_features)} features matched by exact names")
+            print(f"🔧 Using features in training order: {available_features}")
+
+            # Extract features for prediction - IN EXACT TRAINING ORDER
             prediction_features = df[available_features]
 
             print(f"🔮 Making predictions using {len(available_features)} features")
-            print(f"   Matching strategy: {matching_strategy}")
-            print(f"   Features used: {available_features}")
+            print(f"   Features used (in training order): {available_features}")
 
             # Make predictions
             primary_predictions, probabilities, top_predictions, top_confidences = self.predict_with_confidence(prediction_features, top_n=3)
@@ -1348,6 +1342,265 @@ class ParallelCTDBNN:
             if 'df' in locals():
                 print(f"   File columns: {df.columns.tolist()}")
             raise
+
+
+def main():
+    """Main function with command-line interface - UPDATED with optional split"""
+    parser = argparse.ArgumentParser(
+        description="Enhanced CT-DBNN Classifier with Comprehensive Prediction System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run with GUI
+  python ct_dbnn_enhanced.py --gui
+
+  # Train on Iris dataset with no test split (use all data for training)
+  python ct_dbnn_enhanced.py --dataset iris --train
+
+  # Train with 80% training data, 20% testing
+  python ct_dbnn_enhanced.py --dataset iris --train --train-split 80
+
+  # Train with custom parameters and no test split
+  python ct_dbnn_enhanced.py --csv data.csv --features col1,col2,col3 --target outcome --train --no-split
+
+  # Load and evaluate model
+  python ct_dbnn_enhanced.py --load-model model.pkl --evaluate
+
+  # Predict on new data
+  python ct_dbnn_enhanced.py --load-model model.pkl --predict new_data.csv
+        """
+    )
+
+    # Data options
+    data_group = parser.add_argument_group('Data Options')
+    data_group.add_argument('--dataset', help='UCI dataset to use (name from repository or custom)')
+    data_group.add_argument('--csv', help='Custom CSV file path')
+    data_group.add_argument('--features', help='Comma-separated list of features to use for training/prediction')
+    data_group.add_argument('--target', help='Target column name')
+
+    # Model options
+    model_group = parser.add_argument_group('Model Options')
+    model_group.add_argument('--resol', type=int, default=8,
+                           help='Resolution for feature discretization (default: 8)')
+    model_group.add_argument('--no-complex-tensor', action='store_true',
+                           help='Disable complex tensor operations')
+    model_group.add_argument('--no-orthogonal-weights', action='store_true',
+                           help='Disable orthogonal weight initialization')
+    model_group.add_argument('--smoothing-factor', type=float, default=1e-8,
+                           help='Smoothing factor for probabilities (default: 1e-8)')
+    model_group.add_argument('--no-parallel', action='store_true',
+                           help='Disable parallel processing')
+    model_group.add_argument('--n-jobs', type=int, default=-1,
+                           help='Number of parallel jobs (default: -1 for all)')
+
+    # Training options
+    training_group = parser.add_argument_group('Training Options')
+    training_group.add_argument('--train', action='store_true', help='Train model on dataset')
+    training_group.add_argument('--no-split', action='store_true',
+                               help='Use all data for training (no test split)')
+    training_group.add_argument('--train-split', type=float, default=80,
+                               help='Percentage of data to use for training (default: 80)')
+    training_group.add_argument('--evaluate', action='store_true',
+                               help='Evaluate model on test set (requires train/test split)')
+
+    # Operation modes
+    operation_group = parser.add_argument_group('Operation Modes')
+    operation_group.add_argument('--gui', action='store_true',
+                               help='Launch GUI interface')
+    operation_group.add_argument('--load-model', help='Load model from file')
+    operation_group.add_argument('--save-model', help='Save model to file')
+    operation_group.add_argument('--save-hp', help='Save hyperparameters to JSON file')
+    operation_group.add_argument('--load-hp', help='Load hyperparameters from JSON file')
+
+    # Prediction options
+    pred_group = parser.add_argument_group('Prediction Options')
+    pred_group.add_argument('--predict', help='Run prediction on specified file')
+    pred_group.add_argument('--has-target', action='store_true',
+                          help='Input file has target column (will be ignored for prediction)')
+    pred_group.add_argument('--target-col', help='Target column name in prediction file')
+
+    # Additional options
+    parser.add_argument('--random-state', type=int, default=42,
+                       help='Random state for reproducibility (default: 42)')
+
+    args = parser.parse_args()
+
+    # GUI mode
+    if args.gui:
+        if not GUI_AVAILABLE:
+            print("GUI libraries not available. Please install tkinter, matplotlib, and pandas.")
+            return 1
+
+        app = EnhancedGUI()
+        app.run()
+        return 0
+
+    # Command-line mode - Prediction
+    if args.predict:
+        if not args.load_model:
+            print("❌ Please specify --load-model for prediction")
+            return 1
+
+        model = ParallelCTDBNN()
+        model.load_model(args.load_model)
+
+        features_to_use = None
+        if args.features:
+            features_to_use = [f.strip() for f in args.features.split(',')]
+
+        try:
+            results_df = model.predict_on_file(
+                filepath=args.predict,
+                features_to_use=features_to_use,
+                has_target=args.has_target,
+                target_column=args.target_col
+            )
+            print(f"✅ Prediction completed. Results saved to: {args.predict.replace('.csv', '_predictions.csv')}")
+            return 0
+        except Exception as e:
+            print(f"❌ Prediction failed: {e}")
+            return 1
+
+    # Command-line mode - Load existing model
+    if args.load_model:
+        model = ParallelCTDBNN()
+        model.load_model(args.load_model)
+
+        if args.evaluate:
+            if hasattr(model, 'X_test') and model.X_test is not None:
+                accuracy = model.evaluate(model.X_test, model.y_test)
+                print(f"Test accuracy: {accuracy:.3f}")
+            else:
+                print("❌ Cannot evaluate: No test data available in loaded model")
+
+        if args.save_model:
+            model.save_model(args.save_model)
+
+        return 0
+
+    # Training mode
+    if args.dataset or args.csv:
+        config = {
+            'resol': args.resol,
+            'use_complex_tensor': not args.no_complex_tensor,
+            'orthogonalize_weights': not args.no_orthogonal_weights,
+            'smoothing_factor': args.smoothing_factor,
+            'parallel_processing': not args.no_parallel,
+            'n_jobs': args.n_jobs
+        }
+
+        # Load data
+        if args.dataset:
+            print(f"Loading dataset: {args.dataset}")
+            if args.dataset == "iris":
+                data = load_iris()
+            elif args.dataset == "wine":
+                data = load_wine()
+            elif args.dataset == "breast_cancer":
+                data = load_breast_cancer()
+            elif args.dataset == "diabetes":
+                info = UCI_DATASETS["diabetes"]
+                df = UCIDatasetLoader.download_uci_data(info)
+                data = type('DiabetesData', (), {})()
+                data.data = df.iloc[:, :-1].values
+                data.target = df.iloc[:, -1].values
+            else:
+                info = UCIDatasetLoader.load_any_uci_dataset(args.dataset)
+                if info:
+                    df = UCIDatasetLoader.download_uci_data(info)
+                    if df is not None:
+                        data = type('CustomData', (), {})()
+                        data.data = df.iloc[:, :-1].values
+                        data.target = df.iloc[:, -1].values
+                    else:
+                        print(f"Could not download dataset: {args.dataset}")
+                        return 1
+                else:
+                    print(f"Dataset {args.dataset} not found")
+                    return 1
+
+            features = data.data
+            targets = data.target
+
+        elif args.csv:
+            if not args.target:
+                print("Please specify --target for CSV files")
+                return 1
+
+            print(f"Loading CSV: {args.csv}")
+            df = pd.read_csv(args.csv)
+
+            if args.features:
+                features_to_use = [f.strip() for f in args.features.split(',')]
+                missing_features = [f for f in features_to_use if f not in df.columns]
+                if missing_features:
+                    print(f"❌ Missing features: {missing_features}")
+                    return 1
+                features = df[features_to_use].values
+            else:
+                features_to_use = [col for col in df.columns if col != args.target]
+                features = df[features_to_use].values
+
+            targets = df[args.target].values
+            feature_names = features_to_use if args.features else [col for col in df.columns if col != args.target]
+
+        # Handle train/test split based on arguments
+        if args.no_split:
+            X_train = features
+            y_train = targets
+            X_test = None
+            y_test = None
+            print("✅ Using 100% of data for training (no test split)")
+            print(f"   Training samples: {len(X_train)}")
+        else:
+            test_size = (100 - args.train_split) / 100.0
+            X_train, X_test, y_train, y_test = train_test_split(
+                features, targets,
+                test_size=test_size,
+                random_state=args.random_state,
+                stratify=targets
+            )
+            print(f"✅ Data split: {args.train_split}% training, {100-args.train_split}% testing")
+            print(f"   Training samples: {len(X_train)}")
+            print(f"   Testing samples: {len(X_test)}")
+
+        # Initialize and train model
+        model = ParallelCTDBNN(config)
+
+        if 'feature_names' in locals():
+            model.feature_names = feature_names
+            model.selected_features = feature_names
+            model.target_column_name = args.target
+
+        print("Computing global likelihoods...")
+        model.compute_global_likelihoods(X_train, y_train, feature_names if 'feature_names' in locals() else None)
+
+        if args.train:
+            print("Training model...")
+            model.train(X_train, y_train)
+
+            if args.evaluate:
+                if X_test is not None and y_test is not None:
+                    accuracy = model.evaluate(X_test, y_test)
+                    print(f"Test accuracy: {accuracy:.3f}")
+                else:
+                    print("❌ Cannot evaluate: No test data available (use --train-split instead of --no-split)")
+
+        if args.save_model:
+            model.save_model(args.save_model)
+
+        if args.save_hp:
+            model.save_hyperparameters(args.save_hp)
+
+    elif args.load_hp:
+        model = ParallelCTDBNN()
+        model.load_hyperparameters(args.load_hp)
+        print(f"Loaded hyperparameters: {model.config}")
+
+    else:
+        parser.print_help()
+
+    return 0
 
 
 class EnhancedGUI:
@@ -2753,264 +3006,6 @@ Top 5 Predictions (by confidence):
         else:
             print("GUI not available. Use command-line interface.")
 
-
-def main():
-    """Main function with command-line interface - UPDATED with optional split"""
-    parser = argparse.ArgumentParser(
-        description="Enhanced CT-DBNN Classifier with Comprehensive Prediction System",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Run with GUI
-  python ct_dbnn_enhanced.py --gui
-
-  # Train on Iris dataset with no test split (use all data for training)
-  python ct_dbnn_enhanced.py --dataset iris --train
-
-  # Train with 80% training data, 20% testing
-  python ct_dbnn_enhanced.py --dataset iris --train --train-split 80
-
-  # Train with custom parameters and no test split
-  python ct_dbnn_enhanced.py --csv data.csv --features col1,col2,col3 --target outcome --train --no-split
-
-  # Load and evaluate model
-  python ct_dbnn_enhanced.py --load-model model.pkl --evaluate
-
-  # Predict on new data
-  python ct_dbnn_enhanced.py --load-model model.pkl --predict new_data.csv
-        """
-    )
-
-    # Data options
-    data_group = parser.add_argument_group('Data Options')
-    data_group.add_argument('--dataset', help='UCI dataset to use (name from repository or custom)')
-    data_group.add_argument('--csv', help='Custom CSV file path')
-    data_group.add_argument('--features', help='Comma-separated list of features to use for training/prediction')
-    data_group.add_argument('--target', help='Target column name')
-
-    # Model options
-    model_group = parser.add_argument_group('Model Options')
-    model_group.add_argument('--resol', type=int, default=8,
-                           help='Resolution for feature discretization (default: 8)')
-    model_group.add_argument('--no-complex-tensor', action='store_true',
-                           help='Disable complex tensor operations')
-    model_group.add_argument('--no-orthogonal-weights', action='store_true',
-                           help='Disable orthogonal weight initialization')
-    model_group.add_argument('--smoothing-factor', type=float, default=1e-8,
-                           help='Smoothing factor for probabilities (default: 1e-8)')
-    model_group.add_argument('--no-parallel', action='store_true',
-                           help='Disable parallel processing')
-    model_group.add_argument('--n-jobs', type=int, default=-1,
-                           help='Number of parallel jobs (default: -1 for all)')
-
-    # Training options
-    training_group = parser.add_argument_group('Training Options')
-    training_group.add_argument('--train', action='store_true', help='Train model on dataset')
-    training_group.add_argument('--no-split', action='store_true',
-                               help='Use all data for training (no test split)')
-    training_group.add_argument('--train-split', type=float, default=80,
-                               help='Percentage of data to use for training (default: 80)')
-    training_group.add_argument('--evaluate', action='store_true',
-                               help='Evaluate model on test set (requires train/test split)')
-
-    # Operation modes
-    operation_group = parser.add_argument_group('Operation Modes')
-    operation_group.add_argument('--gui', action='store_true',
-                               help='Launch GUI interface')
-    operation_group.add_argument('--load-model', help='Load model from file')
-    operation_group.add_argument('--save-model', help='Save model to file')
-    operation_group.add_argument('--save-hp', help='Save hyperparameters to JSON file')
-    operation_group.add_argument('--load-hp', help='Load hyperparameters from JSON file')
-
-    # Prediction options
-    pred_group = parser.add_argument_group('Prediction Options')
-    pred_group.add_argument('--predict', help='Run prediction on specified file')
-    pred_group.add_argument('--has-target', action='store_true',
-                          help='Input file has target column (will be ignored for prediction)')
-    pred_group.add_argument('--target-col', help='Target column name in prediction file')
-
-    # Additional options
-    parser.add_argument('--random-state', type=int, default=42,
-                       help='Random state for reproducibility (default: 42)')
-
-    args = parser.parse_args()
-
-    # GUI mode
-    if args.gui:
-        if not GUI_AVAILABLE:
-            print("GUI libraries not available. Please install tkinter, matplotlib, and pandas.")
-            return 1
-
-        app = EnhancedGUI()
-        app.run()
-        return 0
-
-    # Command-line mode - Prediction
-    if args.predict:
-        if not args.load_model:
-            print("❌ Please specify --load-model for prediction")
-            return 1
-
-        model = ParallelCTDBNN()
-        model.load_model(args.load_model)
-
-        features_to_use = None
-        if args.features:
-            features_to_use = [f.strip() for f in args.features.split(',')]
-
-        try:
-            results_df = model.predict_on_file(
-                filepath=args.predict,
-                features_to_use=features_to_use,
-                has_target=args.has_target,
-                target_column=args.target_col
-            )
-            print(f"✅ Prediction completed. Results saved to: {args.predict.replace('.csv', '_predictions.csv')}")
-            return 0
-        except Exception as e:
-            print(f"❌ Prediction failed: {e}")
-            return 1
-
-    # Command-line mode - Load existing model
-    if args.load_model:
-        model = ParallelCTDBNN()
-        model.load_model(args.load_model)
-
-        if args.evaluate:
-            if hasattr(model, 'X_test') and model.X_test is not None:
-                accuracy = model.evaluate(model.X_test, model.y_test)
-                print(f"Test accuracy: {accuracy:.3f}")
-            else:
-                print("❌ Cannot evaluate: No test data available in loaded model")
-
-        if args.save_model:
-            model.save_model(args.save_model)
-
-        return 0
-
-    # Training mode
-    if args.dataset or args.csv:
-        config = {
-            'resol': args.resol,
-            'use_complex_tensor': not args.no_complex_tensor,
-            'orthogonalize_weights': not args.no_orthogonal_weights,
-            'smoothing_factor': args.smoothing_factor,
-            'parallel_processing': not args.no_parallel,
-            'n_jobs': args.n_jobs
-        }
-
-        # Load data
-        if args.dataset:
-            print(f"Loading dataset: {args.dataset}")
-            if args.dataset == "iris":
-                data = load_iris()
-            elif args.dataset == "wine":
-                data = load_wine()
-            elif args.dataset == "breast_cancer":
-                data = load_breast_cancer()
-            elif args.dataset == "diabetes":
-                info = UCI_DATASETS["diabetes"]
-                df = UCIDatasetLoader.download_uci_data(info)
-                data = type('DiabetesData', (), {})()
-                data.data = df.iloc[:, :-1].values
-                data.target = df.iloc[:, -1].values
-            else:
-                info = UCIDatasetLoader.load_any_uci_dataset(args.dataset)
-                if info:
-                    df = UCIDatasetLoader.download_uci_data(info)
-                    if df is not None:
-                        data = type('CustomData', (), {})()
-                        data.data = df.iloc[:, :-1].values
-                        data.target = df.iloc[:, -1].values
-                    else:
-                        print(f"Could not download dataset: {args.dataset}")
-                        return 1
-                else:
-                    print(f"Dataset {args.dataset} not found")
-                    return 1
-
-            features = data.data
-            targets = data.target
-
-        elif args.csv:
-            if not args.target:
-                print("Please specify --target for CSV files")
-                return 1
-
-            print(f"Loading CSV: {args.csv}")
-            df = pd.read_csv(args.csv)
-
-            if args.features:
-                features_to_use = [f.strip() for f in args.features.split(',')]
-                missing_features = [f for f in features_to_use if f not in df.columns]
-                if missing_features:
-                    print(f"❌ Missing features: {missing_features}")
-                    return 1
-                features = df[features_to_use].values
-            else:
-                features_to_use = [col for col in df.columns if col != args.target]
-                features = df[features_to_use].values
-
-            targets = df[args.target].values
-            feature_names = features_to_use if args.features else [col for col in df.columns if col != args.target]
-
-        # Handle train/test split based on arguments
-        if args.no_split:
-            X_train = features
-            y_train = targets
-            X_test = None
-            y_test = None
-            print("✅ Using 100% of data for training (no test split)")
-            print(f"   Training samples: {len(X_train)}")
-        else:
-            test_size = (100 - args.train_split) / 100.0
-            X_train, X_test, y_train, y_test = train_test_split(
-                features, targets,
-                test_size=test_size,
-                random_state=args.random_state,
-                stratify=targets
-            )
-            print(f"✅ Data split: {args.train_split}% training, {100-args.train_split}% testing")
-            print(f"   Training samples: {len(X_train)}")
-            print(f"   Testing samples: {len(X_test)}")
-
-        # Initialize and train model
-        model = ParallelCTDBNN(config)
-
-        if 'feature_names' in locals():
-            model.feature_names = feature_names
-            model.selected_features = feature_names
-            model.target_column_name = args.target
-
-        print("Computing global likelihoods...")
-        model.compute_global_likelihoods(X_train, y_train, feature_names if 'feature_names' in locals() else None)
-
-        if args.train:
-            print("Training model...")
-            model.train(X_train, y_train)
-
-            if args.evaluate:
-                if X_test is not None and y_test is not None:
-                    accuracy = model.evaluate(X_test, y_test)
-                    print(f"Test accuracy: {accuracy:.3f}")
-                else:
-                    print("❌ Cannot evaluate: No test data available (use --train-split instead of --no-split)")
-
-        if args.save_model:
-            model.save_model(args.save_model)
-
-        if args.save_hp:
-            model.save_hyperparameters(args.save_hp)
-
-    elif args.load_hp:
-        model = ParallelCTDBNN()
-        model.load_hyperparameters(args.load_hp)
-        print(f"Loaded hyperparameters: {model.config}")
-
-    else:
-        parser.print_help()
-
-    return 0
 
 if __name__ == "__main__":
     # Add ASCII art and welcome message
