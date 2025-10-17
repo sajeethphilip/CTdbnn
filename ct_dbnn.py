@@ -3013,4 +3013,16 @@ Examples:
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Add ASCII art and welcome message
+    print("""
+    ╔═════════════════════════════════════════════════════════════╗
+    ║              🧠    CT-DBNN CLASSIFIER                       ║
+    ║ Complex Tensor Difference Boosting Bayesian Neural Network  ║
+    ║                 author: nsp@airis4d.com                     ║
+    ║  Artificial Intelligence Research and Intelligent Systems   ║
+    ║                 Thelliyoor 689544, India                    ║
+    ║         Complex Tensor + Parallel + Orthogonisation         ║
+    ╚═════════════════════════════════════════════════════════════╝
+    """)
+
+main()
