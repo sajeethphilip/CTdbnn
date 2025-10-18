@@ -41,6 +41,16 @@ try:
 except ImportError:
     GUI_AVAILABLE = False
 
+import numpy as np
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import threading
+from numba import jit, prange
+try:
+    import cupy as cp  # For GPU acceleration if available
+except:
+    print("No GPU detected. Please isstall cupy if you have GPU")
+    input("Press enter to continue...")
 
 # UCI Dataset Repository with metadata
 UCI_DATASETS = {
@@ -515,6 +525,7 @@ class ParallelCTDBNN:
     Optimized CT-DBNN with CONSISTENT label handling across all operations
     ALWAYS uses original feature names - NO DUMMY NAMES
     """
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = {
             'resol': 8,
@@ -525,6 +536,8 @@ class ParallelCTDBNN:
             'n_jobs': -1,
             'batch_size': 1000,
             'missing_value_placeholder': -99999,
+            'use_gpu': False,  # New config for GPU acceleration
+            'chunk_size': 1000,  # New config for chunk processing
         }
         if config:
             self.config.update(config)
@@ -540,7 +553,14 @@ class ParallelCTDBNN:
         else:
             self.n_jobs = min(self.config['n_jobs'], mp.cpu_count())
 
+        # Check GPU availability
+        self.gpu_available = self.config['use_gpu'] and self._check_gpu_availability()
+
         print(f"🔄 Parallel processing: {self.n_jobs} workers")
+        if self.gpu_available:
+            print("🎯 GPU acceleration: ENABLED")
+        else:
+            print("🎯 GPU acceleration: DISABLED")
 
         # Global data structures - COMPUTED ONCE DURING TRAINING
         self.global_anti_net = None
@@ -589,72 +609,139 @@ class ParallelCTDBNN:
         self.selected_features = None
         self.target_column_name = None
 
+    def _check_gpu_availability(self):
+        """Check if GPU is available for acceleration"""
+        try:
+            import cupy as cp
+            cp.zeros(1)  # Test GPU allocation
+            return True
+        except:
+            return False
+
+    @staticmethod
+    @jit(nopython=True, parallel=True, nogil=True)
+    def _compute_bins_numba(features_norm, binloc, resolution_arr, n_features, missing_value):
+        """NUMBA-optimized bin computation"""
+        n_samples = features_norm.shape[0]
+        bins = np.zeros((n_samples, n_features), dtype=np.int32)
+
+        for sample_idx in prange(n_samples):
+            for i in range(n_features):
+                value = features_norm[sample_idx, i]
+                if value == missing_value:
+                    bins[sample_idx, i] = 0
+                    continue
+
+                feature_idx = i + 1
+                resolution_val = resolution_arr[feature_idx]
+                min_dist = 2.0 * resolution_val
+                best_bin = 0
+
+                for j in range(1, resolution_val + 1):
+                    dist = abs(value - binloc[feature_idx, j])
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_bin = j
+
+                if best_bin > 0:
+                    best_bin -= 1
+
+                bins[sample_idx, i] = best_bin
+
+        return bins
+
+    def _find_closest_bins_batch(self, features_norm):
+        """Batch-optimized bin finding using NUMBA"""
+        if not hasattr(self, 'resolution_arr') or self.resolution_arr is None:
+            raise ValueError("Model not properly initialized")
+
+        n_samples, n_features = features_norm.shape
+
+        # Use NUMBA-optimized function for CPU
+        bins = self._compute_bins_numba(
+            features_norm,
+            self.binloc,
+            self.resolution_arr,
+            n_features,
+            self.config['missing_value_placeholder']
+        )
+
+        return bins
+
+    def _build_likelihoods_chunk(self, chunk_data):
+        """Process a chunk of data for likelihood computation"""
+        chunk_indices, features_norm, targets_encoded = chunk_data
+        n_features = self.innodes
+        resol = self.config['resol']
+
+        # Initialize local anti_net for this chunk
+        local_anti_net = np.zeros(
+            (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
+            dtype=np.float64
+        )
+
+        for sample_idx in chunk_indices:
+            sample_data = features_norm[sample_idx, :]
+            missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
+
+            if missing_count >= n_features:
+                continue
+
+            bins = self._find_closest_bins_batch(sample_data.reshape(1, -1))[0]
+
+            for i in range(n_features):
+                feature_i = i + 1
+                bin_i = bins[i] + 1
+
+                if features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
+                    continue
+
+                for l in range(n_features):
+                    feature_l = l + 1
+                    bin_l = bins[l] + 1
+
+                    if features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
+                        continue
+
+                    k_class = 1
+                    while (k_class <= self.outnodes and
+                           abs(targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
+                        k_class += 1
+
+                    if k_class <= self.outnodes:
+                        local_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
+                        local_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
+
+        return local_anti_net
+
     def compute_global_likelihoods(self, features, targets, feature_names=None):
         """
-        Compute global likelihoods ONCE on entire dataset with comprehensive preprocessing
-        This is called ONLY during training - PRESERVES ACTUAL FEATURE NAMES
+        OPTIMIZED: Compute global likelihoods with parallel processing
         """
         if self.likelihoods_computed:
             print("⚠️  Likelihoods already computed! Using existing global likelihoods.")
             return self.training_features_norm
 
         print("Computing GLOBAL likelihoods on entire dataset...")
-        print("🔧 Applying comprehensive data preprocessing...")
+        start_time = time.time()
 
-        # CRITICAL FIX: Extract actual feature names from the data
+        # Original preprocessing logic (unchanged)
         actual_feature_names = None
-
         if hasattr(features, 'columns'):
-            # DataFrame with column names - USE EXACT COLUMN NAMES
             actual_feature_names = list(features.columns)
-            print(f"🔧 Using DataFrame column names: {actual_feature_names}")
         elif feature_names is not None:
-            # Use provided feature names
             actual_feature_names = feature_names
-            print(f"🔧 Using provided feature names: {actual_feature_names}")
         elif hasattr(features, 'feature_names'):
-            # Data object with feature_names attribute
             actual_feature_names = features.feature_names
-            print(f"🔧 Using data.feature_names: {actual_feature_names}")
         elif hasattr(features, 'feature_names_in_'):
-            # For newer sklearn datasets
             actual_feature_names = list(features.feature_names_in_)
-            print(f"🔧 Using data.feature_names_in_: {actual_feature_names}")
         else:
-            # Try to extract from the data structure
-            try:
-                # For sklearn datasets, they often have feature_names attribute
-                if hasattr(features, 'feature_names'):
-                    actual_feature_names = features.feature_names
-                    print(f"🔧 Using dataset.feature_names: {actual_feature_names}")
-                else:
-                    # Last resort: check if we can infer from the data structure
-                    n_features = features.shape[1] if hasattr(features, 'shape') else len(features[0])
-                    actual_feature_names = [f'Feature_{i+1}' for i in range(n_features)]
-                    print(f"⚠️  No feature names found. Using: {actual_feature_names}")
-            except:
-                n_features = features.shape[1] if hasattr(features, 'shape') else len(features[0])
-                actual_feature_names = [f'Feature_{i+1}' for i in range(n_features)]
-                print(f"⚠️  Could not extract feature names. Using: {actual_feature_names}")
+            n_features = features.shape[1] if hasattr(features, 'shape') else len(features[0])
+            actual_feature_names = [f'Feature_{i+1}' for i in range(n_features)]
 
-        # Preprocess features and targets - PASS ACTUAL FEATURE NAMES
         features_processed = self.preprocessor.fit_transform_features(features, actual_feature_names)
         self.training_targets_encoded = self.preprocessor.fit_transform_targets(targets)
-
-        # Store feature names from preprocessor - USE ACTUAL NAMES
         self.feature_names = self.preprocessor.get_feature_names()
-
-        # Update model metadata with dataset info - USE ACTUAL NAME
-        if hasattr(features, 'name'):
-            self.model_metadata['data_name'] = features.name
-        elif hasattr(targets, 'name'):
-            self.model_metadata['data_name'] = targets.name
-        elif hasattr(self, 'model_metadata') and 'data_name' in self.model_metadata:
-            # Keep existing name if already set
-            pass
-        else:
-            # Use a descriptive name
-            self.model_metadata['data_name'] = f"dataset_{int(time.time())}"
 
         n_samples, n_features = features_processed.shape
         self.innodes = n_features
@@ -662,25 +749,18 @@ class ParallelCTDBNN:
 
         print(f"Data shape: {features_processed.shape}, Resolution: {resol}")
         print(f"✅ ACTUAL Feature names: {self.feature_names}")
-        print(f"Missing values replaced with: {self.config['missing_value_placeholder']}")
 
-        # Step 1: Fit encoder - USE THE SAME ENCODING AS PREPROCESSOR
         self._fit_encoder_consistent()
 
-        # Initialize global arrays with proper dimensions
+        # Initialize arrays (unchanged)
         self.max_val = np.zeros(n_features + 2, dtype=np.float64)
         self.min_val = np.zeros(n_features + 2, dtype=np.float64)
         self.resolution_arr = np.zeros(n_features + 8, dtype=np.int32)
-
-        # Initialize binloc with proper dimensions
         self.binloc = np.zeros((n_features + 2, resol + 8), dtype=np.float64)
 
-        # Compute global min/max (ignoring missing values) - STORE FOR CONSISTENT NORMALIZATION
         for i in range(n_features):
             feature_idx = i + 1
             feature_data = features_processed[:, i]
-
-            # Filter out missing values for min/max calculation
             valid_mask = feature_data != self.config['missing_value_placeholder']
             valid_data = feature_data[valid_mask]
 
@@ -692,69 +772,81 @@ class ParallelCTDBNN:
                 self.min_val[feature_idx] = 0.0
 
             self.resolution_arr[feature_idx] = resol
-
-            # Initialize bin locations
             for j in range(1, resol + 1):
                 self.binloc[feature_idx][j] = (j - 1) * 1.0
 
-        # Normalize features (missing values remain as placeholder during normalization)
-        # STORE THE NORMALIZED FEATURES FOR CONSISTENT PROCESSING
         self.training_features_norm = self._normalize_features(features_processed)
 
-        # Initialize global network counts with proper dimensions
+        # Initialize global network with optimized memory layout
         self.global_anti_net = np.zeros(
             (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
-            dtype=np.float64
+            dtype=np.float64, order='C'  # C-order for better cache performance
         )
 
-        # Build global likelihoods (skip samples with too many missing values)
-        total_samples = len(self.training_features_norm)
-        print(f"Building global likelihoods from {total_samples} samples...")
+        print(f"Building global likelihoods from {n_samples} samples...")
 
-        valid_samples = 0
-        for sample_idx in range(total_samples):
-            # Skip samples that are entirely missing values
-            sample_data = self.training_features_norm[sample_idx, :]
-            missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
+        # PARALLEL PROCESSING OPTIMIZATION
+        if self.config['parallel_processing'] and n_samples > 100:
+            print(f"🔄 Using parallel processing with {self.n_jobs} workers...")
 
-            if missing_count >= n_features:  # Skip if all features are missing
-                continue
+            # Split data into chunks
+            chunk_size = self.config.get('chunk_size', 1000)
+            chunks = []
+            for i in range(0, n_samples, chunk_size):
+                chunk_indices = list(range(i, min(i + chunk_size, n_samples)))
+                chunks.append((chunk_indices, self.training_features_norm, self.training_targets_encoded))
 
-            valid_samples += 1
-            bins = self._find_closest_bins(sample_data)
+            # Process chunks in parallel
+            with ProcessPoolExecutor(max_workers=self.n_jobs) as executor:
+                futures = [executor.submit(self._build_likelihoods_chunk, chunk) for chunk in chunks]
 
-            for i in range(n_features):
-                feature_i = i + 1
-                bin_i = bins[i] + 1
+                for future in as_completed(futures):
+                    chunk_result = future.result()
+                    # Aggregate results
+                    self.global_anti_net += chunk_result
 
-                # Skip if this feature is missing
-                if self.training_features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
+        else:
+            # Sequential fallback for small datasets
+            print("🔁 Using sequential processing (small dataset)...")
+            valid_samples = 0
+
+            for sample_idx in range(n_samples):
+                sample_data = self.training_features_norm[sample_idx, :]
+                missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
+
+                if missing_count >= n_features:
                     continue
 
-                for l in range(n_features):
-                    feature_l = l + 1
-                    bin_l = bins[l] + 1
+                valid_samples += 1
+                bins = self._find_closest_bins_batch(sample_data.reshape(1, -1))[0]
 
-                    # Skip if this feature is missing
-                    if self.training_features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
+                for i in range(n_features):
+                    feature_i = i + 1
+                    bin_i = bins[i] + 1
+
+                    if self.training_features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
                         continue
 
-                    # Find correct class for this sample - USE ENCODED TARGETS
-                    k_class = 1
-                    while (k_class <= self.outnodes and
-                           abs(self.training_targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
-                        k_class += 1
+                    for l in range(n_features):
+                        feature_l = l + 1
+                        bin_l = bins[l] + 1
 
-                    if k_class <= self.outnodes:
-                        self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
-                        self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
+                        if self.training_features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
+                            continue
 
-            if sample_idx > 0 and sample_idx % 50 == 0:
-                print(f"  Processed {sample_idx}/{total_samples} samples...")
+                        k_class = 1
+                        while (k_class <= self.outnodes and
+                               abs(self.training_targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
+                            k_class += 1
 
-        print(f"✅ Used {valid_samples} valid samples (excluding entirely missing samples)")
+                        if k_class <= self.outnodes:
+                            self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
+                            self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
 
-        # Apply smoothing
+                if sample_idx > 0 and sample_idx % 1000 == 0:
+                    print(f"  Processed {sample_idx}/{n_samples} samples...")
+
+        # Apply smoothing (unchanged)
         smoothing = self.config['smoothing_factor']
         for i in range(1, n_features + 1):
             for j in range(1, resol + 1):
@@ -765,9 +857,81 @@ class ParallelCTDBNN:
                         self.global_anti_net[i, j, l, m, 0] += smoothing * self.outnodes
 
         self.likelihoods_computed = True
-        print("✅ Global likelihoods computed and fixed")
+        computation_time = time.time() - start_time
+        print(f"✅ Global likelihoods computed in {computation_time:.2f}s")
 
         return self.training_features_norm
+
+    @staticmethod
+    @jit(nopython=True, parallel=True, nogil=True)
+    def _compute_probabilities_numba(global_anti_net, anti_wts, features_norm, bins,
+                                   n_features, outnodes, missing_value):
+        """NUMBA-optimized probability computation"""
+        n_samples = features_norm.shape[0]
+        probabilities = np.zeros((n_samples, outnodes))
+
+        for sample_idx in prange(n_samples):
+            log_probs = np.zeros(outnodes + 2)
+
+            for i in range(n_features):
+                feature_i = i + 1
+                bin_i = bins[sample_idx, i] + 1
+
+                if features_norm[sample_idx, i] == missing_value:
+                    continue
+
+                for l in range(n_features):
+                    feature_l = l + 1
+                    bin_l = bins[sample_idx, l] + 1
+
+                    if features_norm[sample_idx, l] == missing_value:
+                        continue
+
+                    for k in range(1, outnodes + 1):
+                        if global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] > 0:
+                            likelihood = (global_anti_net[feature_i, bin_i, feature_l, bin_l, k] /
+                                        global_anti_net[feature_i, bin_i, feature_l, bin_l, 0])
+                        else:
+                            likelihood = 1.0 / outnodes
+
+                        weight = anti_wts[feature_i, bin_i, feature_l, bin_l, k]
+
+                        if likelihood > 0 and weight > 0:
+                            log_probs[k] += np.log(likelihood) + np.log(weight)
+
+            max_log = np.max(log_probs[1:outnodes+1])
+            total = 0.0
+
+            for k in range(1, outnodes + 1):
+                prob = np.exp(log_probs[k] - max_log)
+                probabilities[sample_idx, k-1] = prob
+                total += prob
+
+            if total > 0:
+                for k in range(1, outnodes + 1):
+                    probabilities[sample_idx, k-1] /= total
+
+        return probabilities
+
+    def _predict_proba_batch(self, features_norm):
+        """Batch-optimized probability prediction"""
+        n_samples = len(features_norm)
+
+        # Precompute bins for all samples
+        bins = self._find_closest_bins_batch(features_norm)
+
+        # Use NUMBA-optimized computation
+        probabilities = self._compute_probabilities_numba(
+            self.global_anti_net,
+            self.anti_wts,
+            features_norm,
+            bins,
+            self.innodes,
+            self.outnodes,
+            self.config['missing_value_placeholder']
+        )
+
+        return probabilities
 
     def _fit_encoder_consistent(self):
         """Fit class encoder - CONSISTENT with preprocessor encoding"""
@@ -839,64 +1003,38 @@ class ParallelCTDBNN:
 
     def compute_class_probabilities(self, features_norm, sample_idx):
         """
-        FIXED: Enhanced probability computation with proper normalization
-        Uses precomputed likelihoods and orthogonal weights
+        MAINTAINED FOR COMPATIBILITY: Enhanced probability computation
+        Uses optimized batch processing internally when possible
         """
-        classval = np.ones(self.outnodes + 2)
-        bins = self._find_closest_bins(features_norm[sample_idx, :])
+        # Handle different types of sample_idx input
+        if hasattr(sample_idx, '__len__'):
+            # sample_idx is an array or list of indices - use batch processing
+            sample_data = features_norm[sample_idx]
+            batch_probs = self._predict_proba_batch(sample_data)
 
-        classval[0] = 0.0
-        n_features = self.innodes
+            # Convert to classval format for compatibility
+            classvals = []
+            for prob in batch_probs:
+                classval = np.ones(self.outnodes + 2)
+                classval[1:self.outnodes+1] = prob
+                classval[0] = 0.0
+                classvals.append(classval)
 
-        # Use log-space to avoid underflow
-        log_probs = np.zeros(self.outnodes + 2)
+            return np.array(classvals)
 
-        for i in range(n_features):
-            feature_i = i + 1
-            bin_i = bins[i] + 1
-
-            # Skip if this feature is missing
-            if features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
-                continue
-
-            for l in range(n_features):
-                feature_l = l + 1
-                bin_l = bins[l] + 1
-
-                # Skip if this feature is missing
-                if features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
-                    continue
-
-                for k in range(1, self.outnodes + 1):
-                    if self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] > 0:
-                        # Use precomputed likelihoods from training
-                        likelihood = (self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k] /
-                                    self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0])
-                    else:
-                        likelihood = 1.0 / self.outnodes
-
-                    # Use precomputed orthogonal weights from training
-                    weight = self.anti_wts[feature_i, bin_i, feature_l, bin_l, k]
-
-                    # Use log to prevent underflow
-                    if likelihood > 0 and weight > 0:
-                        log_probs[k] += np.log(likelihood) + np.log(weight)
-
-        # Convert back from log space with numerical stability
-        max_log = np.max(log_probs[1:self.outnodes+1])
-        for k in range(1, self.outnodes + 1):
-            classval[k] = np.exp(log_probs[k] - max_log)
-
-        # Normalize to proper probabilities
-        total = np.sum(classval[1:self.outnodes+1])
-        if total > 0:
-            for k in range(1, self.outnodes + 1):
-                classval[k] /= total
-
-        classval[0] = 0.0
-
-        return classval
-
+        else:
+            # sample_idx is a single integer index
+            if isinstance(sample_idx, int) and sample_idx >= 0:
+                # Use batch processing for single sample for efficiency
+                sample_data = features_norm[sample_idx:sample_idx+1]
+                batch_probs = self._predict_proba_batch(sample_data)
+                classval = np.ones(self.outnodes + 2)
+                classval[1:self.outnodes+1] = batch_probs[0]
+                classval[0] = 0.0
+                return classval
+            else:
+                # Fallback to original method for edge cases
+                return self._compute_class_probabilities_single(features_norm[sample_idx])
     def train(self, features_train, targets_train):
         """
         ONE-STEP TRAINING with orthogonal weight initialization
@@ -959,7 +1097,7 @@ class ParallelCTDBNN:
         return training_time
 
     def _normalize_features(self, features):
-        """Normalize features using stored global min/max from training"""
+        """OPTIMIZED: Normalize features using vectorized operations"""
         if not isinstance(features, np.ndarray):
             features = np.array(features)
 
@@ -973,16 +1111,13 @@ class ParallelCTDBNN:
             feature_idx = i + 1
             feature_data = features[:, i]
 
-            # Preserve missing values
             missing_mask = feature_data == self.config['missing_value_placeholder']
-
             feature_range = self.max_val[feature_idx] - self.min_val[feature_idx]
+
             if feature_range > 0:
                 normalized = (feature_data - self.min_val[feature_idx]) / feature_range
                 normalized = np.clip(normalized, 0, 1)
                 normalized = normalized * (self.resolution_arr[feature_idx] - 1)
-
-                # Restore missing values
                 normalized[missing_mask] = self.config['missing_value_placeholder']
                 features_norm[:, i] = normalized
             else:
@@ -991,65 +1126,95 @@ class ParallelCTDBNN:
         return features_norm
 
     def _find_closest_bins(self, feature_vector):
-        """Find closest bins for a feature vector, handling missing values"""
-        n_features = self.innodes
-        bins = np.zeros(n_features, dtype=np.int32)
-
-        for i in range(n_features):
-            feature_idx = i + 1
-            value = feature_vector[i]
-
-            # If value is missing, assign to bin 0
-            if value == self.config['missing_value_placeholder']:
-                bins[i] = 0
-                continue
-
-            resolution_val = self.resolution_arr[feature_idx]
-
-            min_dist = 2.0 * resolution_val
-            best_bin = 0
-
-            for j in range(1, resolution_val + 1):
-                dist = abs(value - self.binloc[feature_idx][j])
-                if dist < min_dist:
-                    min_dist = dist
-                    best_bin = j
-
-            if best_bin > 0:
-                best_bin -= 1
-
-            bins[i] = best_bin
-
-        return bins
+        """MAINTAINED FOR COMPATIBILITY: Find closest bins for a feature vector"""
+        # Use the optimized batch method internally
+        bins_batch = self._find_closest_bins_batch(feature_vector.reshape(1, -1))
+        return bins_batch[0]
 
     def predict_proba(self, features):
-        """Predict class probabilities using precomputed model parameters"""
+        """OPTIMIZED: Predict class probabilities using parallel processing"""
         if not self.likelihoods_computed or not self.is_trained:
             raise ValueError("Model must be trained first!")
 
-        # Preprocess features using the SAME preprocessor from training
+        # Preprocess features
         features_processed = self.preprocessor.transform_features(features)
-
-        # Normalize using the SAME min/max from training
         features_norm = self._normalize_features(features_processed)
         n_samples = len(features_norm)
 
-        probabilities = np.zeros((n_samples, self.outnodes))
+        print(f"🔮 Predicting probabilities for {n_samples} samples...")
 
-        for sample_idx in range(n_samples):
-            # Use precomputed likelihoods and orthogonal weights
-            classval = self.compute_class_probabilities(features_norm, sample_idx)
-            for k in range(1, self.outnodes + 1):
-                probabilities[sample_idx, k-1] = classval[k]
+        # Use batch processing for large datasets
+        if n_samples > 1000 and self.config['parallel_processing']:
+            chunk_size = self.config.get('chunk_size', 1000)
+            all_probabilities = []
+
+            for i in range(0, n_samples, chunk_size):
+                chunk_end = min(i + chunk_size, n_samples)
+                chunk_features = features_norm[i:chunk_end]
+
+                chunk_probs = self._predict_proba_batch(chunk_features)
+                all_probabilities.append(chunk_probs)
+
+            probabilities = np.vstack(all_probabilities)
+        else:
+            probabilities = self._predict_proba_batch(features_norm)
 
         return probabilities
 
+    def _compute_class_probabilities_single(self, sample_data):
+        """Single sample probability computation (for compatibility)"""
+        # This maintains compatibility with the original interface
+        bins = self._find_closest_bins_batch(sample_data.reshape(1, -1))[0]
+        n_features = self.innodes
+
+        classval = np.ones(self.outnodes + 2)
+        log_probs = np.zeros(self.outnodes + 2)
+
+        for i in range(n_features):
+            feature_i = i + 1
+            bin_i = bins[i] + 1
+
+            if sample_data[i] == self.config['missing_value_placeholder']:
+                continue
+
+            for l in range(n_features):
+                feature_l = l + 1
+                bin_l = bins[l] + 1
+
+                if sample_data[l] == self.config['missing_value_placeholder']:
+                    continue
+
+                for k in range(1, self.outnodes + 1):
+                    if self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] > 0:
+                        likelihood = (self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k] /
+                                    self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0])
+                    else:
+                        likelihood = 1.0 / self.outnodes
+
+                    weight = self.anti_wts[feature_i, bin_i, feature_l, bin_l, k]
+
+                    if likelihood > 0 and weight > 0:
+                        log_probs[k] += np.log(likelihood) + np.log(weight)
+
+        max_log = np.max(log_probs[1:self.outnodes+1])
+        for k in range(1, self.outnodes + 1):
+            classval[k] = np.exp(log_probs[k] - max_log)
+
+        total = np.sum(classval[1:self.outnodes+1])
+        if total > 0:
+            for k in range(1, self.outnodes + 1):
+                classval[k] /= total
+
+        classval[0] = 0.0
+        return classval
+
+
     def predict(self, features):
-        """Predict class labels using precomputed model parameters"""
+        """OPTIMIZED: Predict class labels using batch processing"""
         probabilities = self.predict_proba(features)
         predictions_encoded = np.argmax(probabilities, axis=1) + 1
 
-        # Convert encoded predictions back to original class labels using SAME decoder
+        # Convert encoded predictions back to original class labels
         predictions = []
         for pred_enc in predictions_encoded:
             original_class = self.encoded_to_class.get(float(pred_enc), "Unknown")

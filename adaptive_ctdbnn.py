@@ -396,8 +396,15 @@ class AdaptiveCTDBNN:
                 df = ct_dbnn.UCIDatasetLoader.download_uci_data(dataset_info)
                 if df is not None and not df.empty:
                     self.original_data = df
-                    # Use provided target column or default from dataset info
-                    self.target_column = target_column or dataset_info.get('target_column', 'target')
+
+                    # For UCI datasets, the target is typically the last column
+                    # Let the user specify target column or use the last column by default
+                    if target_column and target_column in df.columns:
+                        self.target_column = target_column
+                    else:
+                        # Use last column as target for UCI datasets
+                        self.target_column = df.columns[-1]
+                        print(f"🎯 Using last column as target: {self.target_column}")
 
                     if selected_features:
                         # Use selected features
@@ -437,7 +444,19 @@ class AdaptiveCTDBNN:
                 if file_path and os.path.exists(file_path):
                     print(f"📁 Loading data from: {file_path}")
                     try:
-                        df = pd.read_csv(file_path)
+                        # Try to read with header first
+                        try:
+                            df = pd.read_csv(file_path)
+                            has_header = True
+                        except:
+                            # If fails, read without header
+                            df = pd.read_csv(file_path, header=None)
+                            has_header = False
+                            # Create generic column names
+                            n_cols = df.shape[1]
+                            df.columns = [f'col_{i}' for i in range(n_cols)]
+                            print(f"📝 No header found, using generic column names: {df.columns.tolist()}")
+
                         self.original_data = df
 
                         if df.empty:
@@ -446,31 +465,43 @@ class AdaptiveCTDBNN:
 
                         # Determine target column
                         if target_column:
-                            self.target_column = target_column
+                            if target_column in df.columns:
+                                self.target_column = target_column
+                            else:
+                                print(f"❌ Target column '{target_column}' not found in data")
+                                print(f"   Available columns: {df.columns.tolist()}")
+                                return False
                         else:
                             # Auto-detect target (last column or common names)
-                            target_candidates = ['target', 'class', 'label', 'outcome', 'diagnosis', 'type']
+                            target_candidates = ['target', 'class', 'label', 'outcome', 'diagnosis', 'type', 'species']
                             for candidate in target_candidates + [df.columns[-1]]:
                                 if candidate in df.columns:
                                     self.target_column = candidate
                                     print(f"🎯 Auto-detected target column: {self.target_column}")
                                     break
                             else:
-                                print("❌ Could not auto-detect target column")
-                                return False
+                                # Use last column as default
+                                self.target_column = df.columns[-1]
+                                print(f"🎯 Using last column as target: {self.target_column}")
 
                         # Determine features to use
                         if selected_features:
+                            # Verify selected features exist
+                            missing_features = [f for f in selected_features if f not in df.columns]
+                            if missing_features:
+                                print(f"❌ Selected features not found: {missing_features}")
+                                print(f"   Available columns: {df.columns.tolist()}")
+                                return False
+
                             self.selected_features = selected_features
                             if self.target_column not in selected_features:
                                 features_to_use = selected_features + [self.target_column]
                             else:
                                 features_to_use = selected_features
                         else:
-                            # Use all numeric features except target
-                            numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
-                            self.selected_features = [col for col in numeric_columns if col != self.target_column]
-                            features_to_use = self.selected_features + [self.target_column]
+                            # Use all features except target
+                            self.selected_features = [col for col in df.columns if col != self.target_column]
+                            features_to_use = df.columns.tolist()
 
                         # Check if we have features to use
                         if not self.selected_features:
@@ -506,7 +537,6 @@ class AdaptiveCTDBNN:
             import traceback
             print(f"🔍 Detailed error: {traceback.format_exc()}")
             return False
-
     def get_data_columns(self) -> List[str]:
         """
         Get all available columns from the loaded data.
@@ -1373,19 +1403,25 @@ class AdaptiveCTDBNNGUI:
 
         self.feature_vars = {}
         columns = self.adaptive_model.get_data_columns()
+
+        if not columns:
+            self.log_output("❌ No columns found in data")
+            return
+
         numeric_cols = self.adaptive_model.get_numeric_columns()
         categorical_cols = self.adaptive_model.get_categorical_columns()
 
-        # Update target combo
+        # Update target combo with ALL columns
         self.target_combo['values'] = columns
         if self.adaptive_model.target_column in columns:
             self.target_var.set(self.adaptive_model.target_column)
         elif columns:
-            self.target_var.set(columns[-1])  # Default to last column
+            # Default to last column for UCI datasets
+            self.target_var.set(columns[-1])
 
-        # Create feature checkboxes
+        # Create feature checkboxes (exclude target column from features)
         for i, col in enumerate(columns):
-            var = tk.BooleanVar(value=col in self.adaptive_model.selected_features if self.adaptive_model.selected_features else True)
+            var = tk.BooleanVar(value=col != self.target_var.get())  # Auto-select non-target columns
             self.feature_vars[col] = var
 
             # Determine column type for styling
@@ -1401,10 +1437,18 @@ class AdaptiveCTDBNNGUI:
 
             display_text = f"{col} ({col_type})"
 
-            cb = ttk.Checkbutton(self.feature_scroll_frame, text=display_text, variable=var)
+            # Highlight target column
+            if col == self.target_var.get():
+                display_text = f"🎯 {display_text} [TARGET]"
+                # Don't allow target to be selected as feature
+                cb = ttk.Checkbutton(self.feature_scroll_frame, text=display_text, variable=var, state="disabled")
+            else:
+                cb = ttk.Checkbutton(self.feature_scroll_frame, text=display_text, variable=var)
+
             cb.pack(anchor=tk.W, padx=5, pady=2)
 
         self.log_output(f"🔧 Available columns: {len(columns)} total, {len(numeric_cols)} numeric, {len(categorical_cols)} categorical")
+        self.log_output(f"🎯 Current target: {self.target_var.get()}")
 
     def select_all_features(self):
         """Select all features."""
