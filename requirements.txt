@@ -1,0 +1,30 @@
+# CT-DBNN & Adaptive CT-DBNN Requirements
+# =======================================
+
+# Core Numerical Computing & Data Manipulation
+numpy>=1.21.0,<2.0.0        # Array operations and numerical computing
+pandas>=1.3.0,<2.0.0        # Data manipulation and analysis
+scikit-learn>=1.0.0,<2.0.0  # Machine learning utilities and datasets
+
+# Parallel Processing & Performance Optimization
+numba>=0.55.0,<0.60.0       # JIT compilation for performance
+joblib>=1.1.0,<2.0.0        # Parallel processing and caching
+
+# Visualization & Plotting
+matplotlib>=3.5.0,<4.0.0    # Plotting and visualization
+
+# GUI Framework (usually bundled with Python)
+tkinter>=0.0.0              # GUI interface (typically included in Python install)
+
+# Web Access for UCI Datasets
+urllib3>=1.26.0,<3.0.0      # HTTP client for downloading datasets
+
+# Scientific Computing (optional dependencies)
+scipy>=1.7.0,<2.0.0         # Advanced scientific computing
+
+# Optional: GPU Acceleration (install only if you have CUDA)
+# cupy-cuda11x>=10.0.0      # For NVIDIA GPUs with CUDA 11.x
+# cupy-cuda12x>=10.0.0      # For NVIDIA GPUs with CUDA 12.x
+
+# Development & Testing (optional)
+pytest>=6.0.0               # Testing framework
