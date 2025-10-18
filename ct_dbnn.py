@@ -49,8 +49,7 @@ from numba import jit, prange
 try:
     import cupy as cp  # For GPU acceleration if available
 except:
-    print("No GPU detected. Please isstall cupy if you have GPU")
-    input("Press enter to continue...")
+    print("Please isstall cupy if you have GPU")
 
 # UCI Dataset Repository with metadata
 UCI_DATASETS = {
@@ -3182,6 +3181,7 @@ if __name__ == "__main__":
     ║  Artificial Intelligence Research and Intelligent Systems   ║
     ║                 Thelliyoor 689544, India                    ║
     ║         Complex Tensor + Parallel + Orthogonisation         ║
+    ║                 implementation: deepseek                    ║
     ╚═════════════════════════════════════════════════════════════╝
     """)
 
