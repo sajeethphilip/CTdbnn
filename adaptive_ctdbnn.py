@@ -30,6 +30,7 @@ import glob
 from datetime import datetime
 from collections import defaultdict
 import gc
+import sys
 
 # Import the enhanced ct_dbnn module
 try:
@@ -393,7 +394,7 @@ class AdaptiveCTDBNN:
                 print(f"🎯 Loading UCI dataset: {self.dataset_name}")
                 dataset_info = ct_dbnn.UCI_DATASETS[self.dataset_name]
                 df = ct_dbnn.UCIDatasetLoader.download_uci_data(dataset_info)
-                if df is not None:
+                if df is not None and not df.empty:
                     self.original_data = df
                     # Use provided target column or default from dataset info
                     self.target_column = target_column or dataset_info.get('target_column', 'target')
@@ -415,6 +416,9 @@ class AdaptiveCTDBNN:
                     self.X_full = df.drop(columns=[self.target_column]).values
                     self.y_full = df[self.target_column].values
                     self.feature_names = df.drop(columns=[self.target_column]).columns.tolist()
+                else:
+                    print(f"❌ Failed to download UCI dataset: {self.dataset_name}")
+                    return False
             else:
                 # Load from file using pandas
                 if file_path is None:
@@ -427,44 +431,68 @@ class AdaptiveCTDBNN:
                     for file in possible_files:
                         if os.path.exists(file):
                             file_path = file
+                            print(f"📁 Found data file: {file_path}")
                             break
 
                 if file_path and os.path.exists(file_path):
-                    df = pd.read_csv(file_path)
-                    self.original_data = df
+                    print(f"📁 Loading data from: {file_path}")
+                    try:
+                        df = pd.read_csv(file_path)
+                        self.original_data = df
 
-                    # Determine target column
-                    if target_column:
-                        self.target_column = target_column
-                    else:
-                        # Auto-detect target (last column or common names)
-                        target_candidates = ['target', 'class', 'label', 'outcome', 'diagnosis', 'type']
-                        for candidate in target_candidates + [df.columns[-1]]:
-                            if candidate in df.columns:
-                                self.target_column = candidate
-                                break
+                        if df.empty:
+                            print("❌ Data file is empty")
+                            return False
 
-                    # Determine features to use
-                    if selected_features:
-                        self.selected_features = selected_features
-                        if self.target_column not in selected_features:
-                            features_to_use = selected_features + [self.target_column]
+                        # Determine target column
+                        if target_column:
+                            self.target_column = target_column
                         else:
-                            features_to_use = selected_features
-                    else:
-                        # Use all numeric features except target
-                        numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
-                        self.selected_features = [col for col in numeric_columns if col != self.target_column]
-                        features_to_use = self.selected_features + [self.target_column]
+                            # Auto-detect target (last column or common names)
+                            target_candidates = ['target', 'class', 'label', 'outcome', 'diagnosis', 'type']
+                            for candidate in target_candidates + [df.columns[-1]]:
+                                if candidate in df.columns:
+                                    self.target_column = candidate
+                                    print(f"🎯 Auto-detected target column: {self.target_column}")
+                                    break
+                            else:
+                                print("❌ Could not auto-detect target column")
+                                return False
 
-                    # Filter data
-                    df = df[features_to_use]
-                    self.X_full = df.drop(columns=[self.target_column]).values
-                    self.y_full = df[self.target_column].values
-                    self.feature_names = df.drop(columns=[self.target_column]).columns.tolist()
+                        # Determine features to use
+                        if selected_features:
+                            self.selected_features = selected_features
+                            if self.target_column not in selected_features:
+                                features_to_use = selected_features + [self.target_column]
+                            else:
+                                features_to_use = selected_features
+                        else:
+                            # Use all numeric features except target
+                            numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
+                            self.selected_features = [col for col in numeric_columns if col != self.target_column]
+                            features_to_use = self.selected_features + [self.target_column]
 
-            if self.X_full is None or self.y_full is None:
-                print("❌ Failed to load data")
+                        # Check if we have features to use
+                        if not self.selected_features:
+                            print("❌ No features selected for training")
+                            return False
+
+                        # Filter data
+                        df = df[features_to_use]
+                        self.X_full = df.drop(columns=[self.target_column]).values
+                        self.y_full = df[self.target_column].values
+                        self.feature_names = df.drop(columns=[self.target_column]).columns.tolist()
+
+                    except Exception as e:
+                        print(f"❌ Error reading data file: {e}")
+                        return False
+                else:
+                    print("❌ No data file found and no UCI dataset specified")
+                    print("💡 Available UCI datasets:", list(ct_dbnn.UCI_DATASETS.keys()))
+                    return False
+
+            if self.X_full is None or self.y_full is None or len(self.X_full) == 0:
+                print("❌ Failed to load data - no samples found")
                 return False
 
             print(f"✅ Data loaded: {self.X_full.shape[0]} samples, {self.X_full.shape[1]} features")
@@ -475,6 +503,8 @@ class AdaptiveCTDBNN:
 
         except Exception as e:
             print(f"❌ Error loading data: {e}")
+            import traceback
+            print(f"🔍 Detailed error: {traceback.format_exc()}")
             return False
 
     def get_data_columns(self) -> List[str]:
@@ -1727,18 +1757,77 @@ def run_command_line():
     """Run the command line interface."""
     print("""
     ╔═════════════════════════════════════════════════════════════╗
-    ║          Enhanced Adaptive CT-DBNN Wrapper                ║
-    ║        Adaptive Learning with CT-DBNN Backend              ║
-    ║                 author: nsp@airis4d.com                    ║
+    ║              🧠    CT-DBNN CLASSIFIER                       ║
+    ║ Complex Tensor Difference Boosting Bayesian Neural Network  ║
+    ║                 author: nsp@airis4d.com                     ║
+    ║  Artificial Intelligence Research and Intelligent Systems   ║
+    ║                 Thelliyoor 689544, India                    ║
+    ║         Complex Tensor + Parallel + Orthogonisation         ║
     ╚═════════════════════════════════════════════════════════════╝
     """)
 
-    # Example command line usage
-    if len(sys.argv) > 1:
-        dataset_name = sys.argv[1]
-        print(f"🎯 Running adaptive learning on dataset: {dataset_name}")
+    import sys
 
-        adaptive_model = AdaptiveCTDBNN(dataset_name)
+    # Parse command line arguments
+    dataset_name = None
+    file_path = None
+    config_file = None
+
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg in ["--csv", "--file"] and i + 1 < len(sys.argv):
+            file_path = sys.argv[i + 1]
+            i += 2
+        elif arg in ["--dataset", "-d"] and i + 1 < len(sys.argv):
+            dataset_name = sys.argv[i + 1]
+            i += 2
+        elif arg in ["--config", "-c"] and i + 1 < len(sys.argv):
+            config_file = sys.argv[i + 1]
+            i += 2
+        elif arg in ["--help", "-h"]:
+            print_help()
+            return
+        elif not arg.startswith("--"):
+            # Assume it's a dataset name or file path
+            if arg.endswith('.csv') or arg.endswith('.data'):
+                file_path = arg
+            else:
+                dataset_name = arg
+            i += 1
+        else:
+            i += 1
+
+    # Load configuration if provided
+    config = {}
+    if config_file and os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+            print(f"✅ Loaded configuration from: {config_file}")
+        except Exception as e:
+            print(f"❌ Failed to load configuration: {e}")
+
+    # Determine what to run
+    if file_path:
+        print(f"🎯 Running adaptive learning on file: {file_path}")
+        dataset_name = os.path.splitext(os.path.basename(file_path))[0]
+        adaptive_model = AdaptiveCTDBNN(dataset_name, config)
+
+        if adaptive_model.load_and_preprocess_data(file_path=file_path):
+            X_train, y_train, X_test, y_test = adaptive_model.adaptive_learn()
+            print(f"✅ Adaptive learning completed!")
+            print(f"📊 Results: {len(X_train)} training samples, {len(X_test)} test samples")
+            print(f"🏆 Best accuracy: {adaptive_model.best_accuracy:.4f}")
+
+            # Save model automatically
+            adaptive_model.save_model()
+        else:
+            print("❌ Failed to load data from file")
+
+    elif dataset_name:
+        print(f"🎯 Running adaptive learning on dataset: {dataset_name}")
+        adaptive_model = AdaptiveCTDBNN(dataset_name, config)
 
         if adaptive_model.load_and_preprocess_data():
             X_train, y_train, X_test, y_test = adaptive_model.adaptive_learn()
@@ -1749,11 +1838,32 @@ def run_command_line():
             # Save model automatically
             adaptive_model.save_model()
         else:
-            print("❌ Failed to load data")
+            print("❌ Failed to load dataset")
     else:
-        print("💡 Usage: python adaptive_ctdbnn.py <dataset_name>")
-        print("💡 Or: python adaptive_ctdbnn.py --gui (for graphical interface)")
-        print("📋 Available UCI datasets:", list(ct_dbnn.UCI_DATASETS.keys()))
+        print_help()
+
+def print_help():
+    """Print command line help."""
+    print("""
+Usage: python adaptive_ctdbnn.py [OPTIONS] [DATASET_OR_FILE]
+
+Options:
+  --csv FILE, --file FILE    Use CSV file for training
+  --dataset NAME, -d NAME    Use UCI dataset by name
+  --config FILE, -c FILE     Load configuration from JSON file
+  --help, -h                 Show this help message
+
+Examples:
+  python adaptive_ctdbnn.py --csv data.csv
+  python adaptive_ctdbnn.py --dataset iris
+  python adaptive_ctdbnn.py iris
+  python adaptive_ctdbnn.py data.csv
+  python adaptive_ctdbnn.py --config my_config.json --csv data.csv
+
+Available UCI datasets:""")
+    available_uci = list(ct_dbnn.UCI_DATASETS.keys())
+    for dataset in available_uci:
+        print(f"  - {dataset}")
 
 
 if __name__ == "__main__":
