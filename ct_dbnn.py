@@ -2,6 +2,7 @@
 """
 ENHANCED CT-DBNN MODULE - Complete Prediction System with Feature Selection
 BEAUTIFIED INTERFACE WITH COMPREHENSIVE PREDICTION CAPABILITIES
+NOW WITH INCREMENTAL LEARNING AND FREEZE MECHANISM
 """
 
 import numpy as np
@@ -37,7 +38,6 @@ try:
     import matplotlib
     matplotlib.use('TkAgg')
     GUI_AVAILABLE = True
-    from ct_dbnn_gui import EnhancedGUI
 except ImportError:
     GUI_AVAILABLE = False
 
@@ -49,7 +49,7 @@ from numba import jit, prange
 try:
     import cupy as cp  # For GPU acceleration if available
 except:
-    print("Please isstall cupy if you have GPU")
+    print("Please install cupy if you have GPU")
 
 # UCI Dataset Repository with metadata
 UCI_DATASETS = {
@@ -90,1682 +90,6 @@ UCI_DATASETS = {
         "reference": "Smith, J.W. et al. (1988)"
     }
 }
-
-
-class UCIDatasetLoader:
-    """Loader for fetching any UCI dataset by name"""
-
-    @staticmethod
-    def fetch_dataset_info(dataset_name):
-        """Fetch dataset information from UCI repository"""
-        try:
-            # Try to find dataset in UCI repository
-            base_url = "https://archive.ics.uci.edu/ml/machine-learning-databases/"
-            dataset_urls = [
-                f"{base_url}{dataset_name}/{dataset_name}.data",
-                f"{base_url}{dataset_name.replace('-', '_')}/{dataset_name.replace('-', '_')}.data",
-                f"{base_url}{dataset_name}/data.csv",
-                f"{base_url}{dataset_name.replace('-', '_')}/data.csv"
-            ]
-
-            for url in dataset_urls:
-                try:
-                    response = urllib.request.urlopen(url)
-                    if response.status == 200:
-                        return {
-                            "name": dataset_name.replace('_', ' ').title(),
-                            "url": url,
-                            "description": f"UCI {dataset_name} dataset",
-                            "features": "Unknown",
-                            "samples": "Unknown",
-                            "best_accuracy": "Unknown",
-                            "reference": "UCI Repository"
-                        }
-                except:
-                    continue
-
-            return None
-        except Exception as e:
-            print(f"Error fetching dataset info: {e}")
-            return None
-
-    @staticmethod
-    def load_any_uci_dataset(dataset_name):
-        """Load any UCI dataset by name"""
-        try:
-            # First try predefined datasets
-            if dataset_name in UCI_DATASETS:
-                return UCI_DATASETS[dataset_name]
-
-            # Try to fetch from UCI repository
-            info = UCIDatasetLoader.fetch_dataset_info(dataset_name)
-            if info:
-                return info
-            else:
-                # Try common variations
-                variations = [
-                    dataset_name,
-                    dataset_name.replace('-', ''),
-                    dataset_name.replace('_', ''),
-                    dataset_name.replace('-', '_'),
-                    dataset_name.replace('_', '-')
-                ]
-
-                for var in variations:
-                    info = UCIDatasetLoader.fetch_dataset_info(var)
-                    if info:
-                        return info
-
-            return None
-
-        except Exception as e:
-            print(f"Error loading UCI dataset: {e}")
-            return None
-
-    @staticmethod
-    def download_uci_data(dataset_info):
-        """Download and parse UCI dataset data"""
-        try:
-            url = dataset_info['url']
-            response = urllib.request.urlopen(url)
-            content = response.read().decode('utf-8')
-
-            # Try to parse as CSV
-            try:
-                # Try different delimiters
-                for delimiter in [',', '\t', ';', ' ']:
-                    try:
-                        from io import StringIO
-                        df = pd.read_csv(StringIO(content), delimiter=delimiter, header=None)
-                        if df.shape[1] > 1:  # Valid dataset with multiple columns
-                            return df
-                    except:
-                        continue
-            except:
-                pass
-
-            # If CSV parsing fails, try space-separated
-            lines = content.strip().split('\n')
-            data = []
-            for line in lines:
-                if line.strip() and not line.startswith('@') and not line.startswith('#'):
-                    # Clean the line and split by whitespace
-                    cleaned_line = re.sub(r'\s+', ' ', line.strip())
-                    row = cleaned_line.split(' ')
-                    # Filter out empty strings
-                    row = [x for x in row if x]
-                    if row:
-                        data.append(row)
-
-            if data:
-                # Find maximum columns
-                max_cols = max(len(row) for row in data)
-                # Pad rows with fewer columns
-                for i, row in enumerate(data):
-                    if len(row) < max_cols:
-                        data[i] = row + [np.nan] * (max_cols - len(row))
-
-                return pd.DataFrame(data)
-            else:
-                return None
-
-        except Exception as e:
-            print(f"Error downloading UCI data: {e}")
-            return None
-
-
-class DataPreprocessor:
-    """
-    Comprehensive data preprocessing with CONSISTENT label encoding
-    ALWAYS preserves and uses original feature names - NO DUMMY NAMES
-    """
-    def __init__(self, missing_value_placeholder=-99999):
-        self.missing_value_placeholder = missing_value_placeholder
-        self.feature_encoders = {}  # encoders for each feature column
-        self.target_encoder = None  # encoder for target column
-        self.target_decoder = None  # decoder for target column
-        self.feature_columns = None  # Store original feature names
-        self.target_column = None
-        self.original_dtypes = {}
-        self.is_fitted = False
-
-    def fit_transform_features(self, features, feature_names=None):
-        """Fit and transform features with label encoding and missing value handling"""
-        if isinstance(features, pd.DataFrame):
-            # ALWAYS use DataFrame column names - PRESERVE ORIGINAL NAMES
-            self.feature_columns = list(features.columns)
-            print(f"🔧 Using DataFrame column names: {self.feature_columns}")
-            result = self._fit_transform_dataframe(features)
-        elif isinstance(features, np.ndarray):
-            # FORCE use of provided feature names - NO DUMMY NAMES
-            if feature_names is not None:
-                self.feature_columns = feature_names
-                print(f"🔧 Using provided feature names: {self.feature_columns}")
-            else:
-                # If no names provided, try to extract from the data object
-                n_features = features.shape[1]
-                if hasattr(features, 'columns'):
-                    self.feature_columns = list(features.columns)
-                    print(f"🔧 Using data.columns: {self.feature_columns}")
-                elif hasattr(features, 'feature_names'):
-                    self.feature_columns = features.feature_names
-                    print(f"🔧 Using data.feature_names: {self.feature_columns}")
-                elif hasattr(features, 'feature_names_in_'):
-                    # For newer sklearn datasets
-                    self.feature_columns = list(features.feature_names_in_)
-                    print(f"🔧 Using data.feature_names_in_: {self.feature_columns}")
-                else:
-                    # LAST RESORT: Use descriptive names that indicate source
-                    self.feature_columns = [f'Feature_{i+1}' for i in range(n_features)]
-                    print(f"⚠️  No feature names found. Using: {self.feature_columns}")
-            result = self._fit_transform_array(features)
-        else:
-            # Convert to numpy array and process
-            features_array = np.array(features)
-            if feature_names is not None:
-                self.feature_columns = feature_names
-                print(f"🔧 Using provided feature names: {self.feature_columns}")
-            else:
-                n_features = features_array.shape[1]
-                self.feature_columns = [f'Feature_{i+1}' for i in range(n_features)]
-                print(f"⚠️  No feature names provided. Using: {self.feature_columns}")
-            result = self._fit_transform_array(features_array)
-
-        self.is_fitted = True
-        return result
-
-    def _fit_transform_dataframe(self, df):
-        """Fit and transform DataFrame features - PRESERVE ORIGINAL COLUMN NAMES"""
-        self.feature_columns = list(df.columns)
-        self.original_dtypes = df.dtypes.to_dict()
-
-        processed_data = df.copy()
-        self.feature_encoders = {}
-
-        for col in df.columns:
-            # Handle missing values
-            if df[col].isna().any():
-                processed_data[col] = df[col].fillna(self.missing_value_placeholder)
-
-            # Convert to numeric if possible, otherwise use label encoding
-            if df[col].dtype == 'object' or isinstance(df[col].dtype, pd.CategoricalDtype):
-                # Label encoding for categorical data
-                unique_vals = processed_data[col].unique()
-                encoder = {val: idx for idx, val in enumerate(unique_vals)}
-                self.feature_encoders[col] = encoder
-                processed_data[col] = processed_data[col].map(encoder)
-            else:
-                # Keep numeric data as is, but store identity encoder
-                self.feature_encoders[col] = 'numeric'
-
-        return processed_data.values.astype(np.float64)
-
-    def _fit_transform_array(self, array):
-        """Fit and transform numpy array features - USE ORIGINAL FEATURE NAMES"""
-        processed_data = array.copy().astype(object)
-        n_samples, n_features = array.shape
-
-        # CRITICAL: Use stored feature columns - NO DUMMY NAMES
-        if self.feature_columns is None:
-            self.feature_columns = [f'Column_{i+1}' for i in range(n_features)]
-            print(f"⚠️  No feature columns set. Using: {self.feature_columns}")
-
-        self.feature_encoders = {}
-
-        for col_idx in range(n_features):
-            col_name = self.feature_columns[col_idx]
-            col_data = array[:, col_idx]
-
-            # Handle missing values
-            missing_mask = pd.isna(col_data) if hasattr(pd, 'isna') else (
-                (col_data == None) | ((isinstance(col_data, str)) & ((col_data == 'NaN') | (col_data == 'NA') | (col_data == '')))
-            )
-            if np.any(missing_mask):
-                processed_data[missing_mask, col_idx] = self.missing_value_placeholder
-
-            # Check if column needs encoding (non-numeric)
-            try:
-                # Try to convert to numeric
-                numeric_data = pd.to_numeric(processed_data[:, col_idx], errors='coerce')
-                non_numeric_mask = pd.isna(numeric_data)
-                if np.any(non_numeric_mask):
-                    # Contains non-numeric values, need encoding
-                    unique_vals = np.unique(processed_data[:, col_idx])
-                    encoder = {val: idx for idx, val in enumerate(unique_vals)}
-                    self.feature_encoders[col_name] = encoder  # Use column name as key
-                    for i, val in enumerate(processed_data[:, col_idx]):
-                        processed_data[i, col_idx] = encoder.get(val, 0)
-                else:
-                    # All numeric
-                    processed_data[:, col_idx] = numeric_data
-                    self.feature_encoders[col_name] = 'numeric'  # Use column name as key
-            except:
-                # Fallback: treat as categorical
-                unique_vals = np.unique(processed_data[:, col_idx])
-                encoder = {val: idx for idx, val in enumerate(unique_vals)}
-                self.feature_encoders[col_name] = encoder  # Use column name as key
-                for i, val in enumerate(processed_data[:, col_idx]):
-                    processed_data[i, col_idx] = encoder.get(val, 0)
-
-        return processed_data.astype(np.float64)
-
-    def transform_features(self, features):
-        """Transform features using fitted encoders - HANDLE COLUMN NAMES PROPERLY"""
-        if not self.is_fitted:
-            raise ValueError("Preprocessor must be fitted first")
-
-        if isinstance(features, pd.DataFrame):
-            return self._transform_dataframe(features)
-        elif isinstance(features, np.ndarray):
-            return self._transform_array(features)
-        else:
-            features_array = np.array(features)
-            return self._transform_array(features_array)
-
-    def _transform_dataframe(self, df):
-        """Transform DataFrame features using fitted encoders - USE EXACT TRAINING COLUMN NAMES AND ORDER"""
-        processed_data = df.copy()
-
-        # CRITICAL: Check if all required columns are present
-        missing_columns = []
-        for fitted_col in self.feature_columns:  # Use stored feature columns in training order
-            if fitted_col not in df.columns:
-                missing_columns.append(fitted_col)
-
-        if missing_columns:
-            raise ValueError(f"Missing columns in prediction data: {missing_columns}. "
-                           f"Available columns: {list(df.columns)}. "
-                           f"Expected columns (in training order): {self.feature_columns}")
-
-        # Process only the columns that were fitted, in the exact training order
-        for col in self.feature_columns:
-            # Handle missing values
-            if df[col].isna().any():
-                processed_data[col] = df[col].fillna(self.missing_value_placeholder)
-
-            # Apply encoding if needed
-            if self.feature_encoders[col] != 'numeric':
-                encoder = self.feature_encoders[col]
-                processed_data[col] = processed_data[col].map(
-                    lambda x: encoder.get(x, 0) if x in encoder else 0
-                )
-
-        # Ensure we return only the columns that were fitted, in the CORRECT TRAINING ORDER
-        processed_data = processed_data[self.feature_columns]
-        return processed_data.values.astype(np.float64)
-
-    def _transform_array(self, array):
-        """Transform numpy array features using fitted encoders"""
-        processed_data = array.copy().astype(object)
-        n_samples, n_features = array.shape
-
-        # Check if number of features matches
-        if n_features != len(self.feature_columns):
-            raise ValueError(f"Number of features ({n_features}) doesn't match fitted features ({len(self.feature_columns)})")
-
-        for col_idx in range(n_features):
-            col_name = self.feature_columns[col_idx]
-
-            if col_name not in self.feature_encoders:
-                raise ValueError(f"Column '{col_name}' not seen during fitting. Available columns: {list(self.feature_encoders.keys())}")
-
-            col_data = array[:, col_idx]
-
-            # Handle missing values
-            missing_mask = pd.isna(col_data) if hasattr(pd, 'isna') else (
-                (col_data == None) | ((isinstance(col_data, str)) & ((col_data == 'NaN') | (col_data == 'NA') | (col_data == '')))
-            )
-            if np.any(missing_mask):
-                processed_data[missing_mask, col_idx] = self.missing_value_placeholder
-
-            # Apply encoding if needed
-            if self.feature_encoders[col_name] != 'numeric':
-                encoder = self.feature_encoders[col_name]
-                for i, val in enumerate(processed_data[:, col_idx]):
-                    processed_data[i, col_idx] = encoder.get(val, 0)
-            else:
-                # Convert to numeric
-                try:
-                    processed_data[:, col_idx] = pd.to_numeric(processed_data[:, col_idx], errors='coerce')
-                    processed_data[pd.isna(processed_data[:, col_idx]), col_idx] = self.missing_value_placeholder
-                except:
-                    processed_data[:, col_idx] = self.missing_value_placeholder
-
-        return processed_data.astype(np.float64)
-
-    def fit_transform_targets(self, targets):
-        """Fit and transform targets with label encoding - STORE BOTH ENCODER AND DECODER"""
-        targets_data = self._extract_targets(targets)
-        self.target_encoder = {}
-        self.target_decoder = {}
-
-        unique_vals = np.unique(targets_data)
-        for idx, val in enumerate(unique_vals):
-            encoded_val = float(idx + 1)
-            self.target_encoder[val] = encoded_val
-            self.target_decoder[encoded_val] = val
-
-        encoded = np.array([self.target_encoder[val] for val in targets_data])
-        return encoded.astype(np.float64)
-
-    def transform_targets(self, targets):
-        """Transform targets using fitted encoder"""
-        if self.target_encoder is None:
-            raise ValueError("Target encoder not fitted")
-
-        targets_data = self._extract_targets(targets)
-        encoded = np.array([self.target_encoder.get(val, 0.0) for val in targets_data])
-        return encoded.astype(np.float64)
-
-    def inverse_transform_targets(self, encoded_targets):
-        """Convert encoded targets back to original labels"""
-        if self.target_decoder is None:
-            raise ValueError("Target decoder not fitted")
-
-        if isinstance(encoded_targets, (pd.Series, pd.DataFrame)):
-            original = encoded_targets.map(lambda x: self.target_decoder.get(x, "Unknown"))
-        else:
-            original = np.array([self.target_decoder.get(x, "Unknown") for x in encoded_targets])
-
-        return original
-
-    def _extract_targets(self, targets):
-        """Extract targets array from various input types"""
-        if isinstance(targets, np.ndarray):
-            return targets
-        elif isinstance(targets, pd.Series):
-            return targets.values
-        elif isinstance(targets, pd.DataFrame):
-            return targets.values.flatten()
-        else:
-            try:
-                return np.array(targets)
-            except:
-                raise ValueError(f"Unsupported targets type: {type(targets)}")
-
-    def get_feature_info(self):
-        """Get information about feature encoding"""
-        info = {
-            'missing_value_placeholder': self.missing_value_placeholder,
-            'feature_encoders': {},
-            'target_encoder': self.target_encoder,
-            'target_decoder': self.target_decoder,
-            'is_fitted': self.is_fitted
-        }
-
-        for col, encoder in self.feature_encoders.items():
-            if encoder == 'numeric':
-                info['feature_encoders'][col] = 'numeric'
-            else:
-                info['feature_encoders'][col] = {
-                    'type': 'categorical',
-                    'mapping': encoder,
-                    'num_categories': len(encoder)
-                }
-
-        return info
-
-    def get_feature_names(self):
-        """Get original feature names"""
-        return self.feature_columns
-
-    def __getstate__(self):
-        """Return state for pickling"""
-        state = self.__dict__.copy()
-        return state
-
-    def __setstate__(self, state):
-        """Restore state from pickling"""
-        self.__dict__.update(state)
-
-
-class ParallelCTDBNN:
-    """
-    Optimized CT-DBNN with CONSISTENT label handling across all operations
-    ALWAYS uses original feature names - NO DUMMY NAMES
-    """
-
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        self.config = {
-            'resol': 8,
-            'use_complex_tensor': True,
-            'orthogonalize_weights': True,
-            'smoothing_factor': 1e-8,
-            'parallel_processing': True,
-            'n_jobs': -1,
-            'batch_size': 1000,
-            'missing_value_placeholder': -99999,
-            'use_gpu': False,  # New config for GPU acceleration
-            'chunk_size': 1000,  # New config for chunk processing
-        }
-        if config:
-            self.config.update(config)
-
-        # Data preprocessor
-        self.preprocessor = DataPreprocessor(
-            missing_value_placeholder=self.config['missing_value_placeholder']
-        )
-
-        # Determine number of workers
-        if self.config['n_jobs'] == -1:
-            self.n_jobs = mp.cpu_count()
-        else:
-            self.n_jobs = min(self.config['n_jobs'], mp.cpu_count())
-
-        # Check GPU availability
-        self.gpu_available = self.config['use_gpu'] and self._check_gpu_availability()
-
-        print(f"🔄 Parallel processing: {self.n_jobs} workers")
-        if self.gpu_available:
-            print("🎯 GPU acceleration: ENABLED")
-        else:
-            print("🎯 GPU acceleration: DISABLED")
-
-        # Global data structures - COMPUTED ONCE DURING TRAINING
-        self.global_anti_net = None
-        self.binloc = None
-        self.max_val = None
-        self.min_val = None
-        self.dmyclass = None
-        self.resolution_arr = None
-
-        # Weight structures - COMPUTED ONCE DURING TRAINING
-        self.anti_wts = None
-        self.complex_weights = None
-
-        # State
-        self.innodes = 0
-        self.outnodes = 0
-        self.class_to_encoded = None
-        self.encoded_to_class = None
-        self.is_trained = False
-        self.likelihoods_computed = False
-
-        # Feature names for proper output
-        self.feature_names = None
-        self.target_name = None
-
-        # Training history
-        self.training_history = {
-            'training_time': 0,
-            'train_accuracy': 0,
-            'test_accuracy': 0,
-            'config': self.config.copy()
-        }
-
-        # Store normalized training features for consistent processing
-        self.training_features_norm = None
-        self.training_targets_encoded = None
-
-        # Model metadata
-        self.model_metadata = {
-            'creation_time': time.time(),
-            'version': '1.0.0',
-            'data_name': 'unknown_dataset'
-        }
-
-        # Feature selection
-        self.selected_features = None
-        self.target_column_name = None
-
-    def _check_gpu_availability(self):
-        """Check if GPU is available for acceleration"""
-        try:
-            import cupy as cp
-            cp.zeros(1)  # Test GPU allocation
-            return True
-        except:
-            return False
-
-    @staticmethod
-    @jit(nopython=True, parallel=True, nogil=True)
-    def _compute_bins_numba(features_norm, binloc, resolution_arr, n_features, missing_value):
-        """NUMBA-optimized bin computation"""
-        n_samples = features_norm.shape[0]
-        bins = np.zeros((n_samples, n_features), dtype=np.int32)
-
-        for sample_idx in prange(n_samples):
-            for i in range(n_features):
-                value = features_norm[sample_idx, i]
-                if value == missing_value:
-                    bins[sample_idx, i] = 0
-                    continue
-
-                feature_idx = i + 1
-                resolution_val = resolution_arr[feature_idx]
-                min_dist = 2.0 * resolution_val
-                best_bin = 0
-
-                for j in range(1, resolution_val + 1):
-                    dist = abs(value - binloc[feature_idx, j])
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_bin = j
-
-                if best_bin > 0:
-                    best_bin -= 1
-
-                bins[sample_idx, i] = best_bin
-
-        return bins
-
-    def _find_closest_bins_batch(self, features_norm):
-        """Batch-optimized bin finding using NUMBA"""
-        if not hasattr(self, 'resolution_arr') or self.resolution_arr is None:
-            raise ValueError("Model not properly initialized")
-
-        n_samples, n_features = features_norm.shape
-
-        # Use NUMBA-optimized function for CPU
-        bins = self._compute_bins_numba(
-            features_norm,
-            self.binloc,
-            self.resolution_arr,
-            n_features,
-            self.config['missing_value_placeholder']
-        )
-
-        return bins
-
-    def _build_likelihoods_chunk(self, chunk_data):
-        """Process a chunk of data for likelihood computation"""
-        chunk_indices, features_norm, targets_encoded = chunk_data
-        n_features = self.innodes
-        resol = self.config['resol']
-
-        # Initialize local anti_net for this chunk
-        local_anti_net = np.zeros(
-            (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
-            dtype=np.float64
-        )
-
-        for sample_idx in chunk_indices:
-            sample_data = features_norm[sample_idx, :]
-            missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
-
-            if missing_count >= n_features:
-                continue
-
-            bins = self._find_closest_bins_batch(sample_data.reshape(1, -1))[0]
-
-            for i in range(n_features):
-                feature_i = i + 1
-                bin_i = bins[i] + 1
-
-                if features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
-                    continue
-
-                for l in range(n_features):
-                    feature_l = l + 1
-                    bin_l = bins[l] + 1
-
-                    if features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
-                        continue
-
-                    k_class = 1
-                    while (k_class <= self.outnodes and
-                           abs(targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
-                        k_class += 1
-
-                    if k_class <= self.outnodes:
-                        local_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
-                        local_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
-
-        return local_anti_net
-
-    def compute_global_likelihoods(self, features, targets, feature_names=None):
-        """
-        OPTIMIZED: Compute global likelihoods with parallel processing
-        """
-        if self.likelihoods_computed:
-            print("⚠️  Likelihoods already computed! Using existing global likelihoods.")
-            return self.training_features_norm
-
-        print("Computing GLOBAL likelihoods on entire dataset...")
-        start_time = time.time()
-
-        # Original preprocessing logic (unchanged)
-        actual_feature_names = None
-        if hasattr(features, 'columns'):
-            actual_feature_names = list(features.columns)
-        elif feature_names is not None:
-            actual_feature_names = feature_names
-        elif hasattr(features, 'feature_names'):
-            actual_feature_names = features.feature_names
-        elif hasattr(features, 'feature_names_in_'):
-            actual_feature_names = list(features.feature_names_in_)
-        else:
-            n_features = features.shape[1] if hasattr(features, 'shape') else len(features[0])
-            actual_feature_names = [f'Feature_{i+1}' for i in range(n_features)]
-
-        features_processed = self.preprocessor.fit_transform_features(features, actual_feature_names)
-        self.training_targets_encoded = self.preprocessor.fit_transform_targets(targets)
-        self.feature_names = self.preprocessor.get_feature_names()
-
-        n_samples, n_features = features_processed.shape
-        self.innodes = n_features
-        resol = self.config['resol']
-
-        print(f"Data shape: {features_processed.shape}, Resolution: {resol}")
-        print(f"✅ ACTUAL Feature names: {self.feature_names}")
-
-        self._fit_encoder_consistent()
-
-        # Initialize arrays (unchanged)
-        self.max_val = np.zeros(n_features + 2, dtype=np.float64)
-        self.min_val = np.zeros(n_features + 2, dtype=np.float64)
-        self.resolution_arr = np.zeros(n_features + 8, dtype=np.int32)
-        self.binloc = np.zeros((n_features + 2, resol + 8), dtype=np.float64)
-
-        for i in range(n_features):
-            feature_idx = i + 1
-            feature_data = features_processed[:, i]
-            valid_mask = feature_data != self.config['missing_value_placeholder']
-            valid_data = feature_data[valid_mask]
-
-            if len(valid_data) > 0:
-                self.max_val[feature_idx] = np.max(valid_data)
-                self.min_val[feature_idx] = np.min(valid_data)
-            else:
-                self.max_val[feature_idx] = 1.0
-                self.min_val[feature_idx] = 0.0
-
-            self.resolution_arr[feature_idx] = resol
-            for j in range(1, resol + 1):
-                self.binloc[feature_idx][j] = (j - 1) * 1.0
-
-        self.training_features_norm = self._normalize_features(features_processed)
-
-        # Initialize global network with optimized memory layout
-        self.global_anti_net = np.zeros(
-            (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
-            dtype=np.float64, order='C'  # C-order for better cache performance
-        )
-
-        print(f"Building global likelihoods from {n_samples} samples...")
-
-        # PARALLEL PROCESSING OPTIMIZATION
-        if self.config['parallel_processing'] and n_samples > 100:
-            print(f"🔄 Using parallel processing with {self.n_jobs} workers...")
-
-            # Split data into chunks
-            chunk_size = self.config.get('chunk_size', 1000)
-            chunks = []
-            for i in range(0, n_samples, chunk_size):
-                chunk_indices = list(range(i, min(i + chunk_size, n_samples)))
-                chunks.append((chunk_indices, self.training_features_norm, self.training_targets_encoded))
-
-            # Process chunks in parallel
-            with ProcessPoolExecutor(max_workers=self.n_jobs) as executor:
-                futures = [executor.submit(self._build_likelihoods_chunk, chunk) for chunk in chunks]
-
-                for future in as_completed(futures):
-                    chunk_result = future.result()
-                    # Aggregate results
-                    self.global_anti_net += chunk_result
-
-        else:
-            # Sequential fallback for small datasets
-            print("🔁 Using sequential processing (small dataset)...")
-            valid_samples = 0
-
-            for sample_idx in range(n_samples):
-                sample_data = self.training_features_norm[sample_idx, :]
-                missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
-
-                if missing_count >= n_features:
-                    continue
-
-                valid_samples += 1
-                bins = self._find_closest_bins_batch(sample_data.reshape(1, -1))[0]
-
-                for i in range(n_features):
-                    feature_i = i + 1
-                    bin_i = bins[i] + 1
-
-                    if self.training_features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
-                        continue
-
-                    for l in range(n_features):
-                        feature_l = l + 1
-                        bin_l = bins[l] + 1
-
-                        if self.training_features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
-                            continue
-
-                        k_class = 1
-                        while (k_class <= self.outnodes and
-                               abs(self.training_targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
-                            k_class += 1
-
-                        if k_class <= self.outnodes:
-                            self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
-                            self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
-
-                if sample_idx > 0 and sample_idx % 1000 == 0:
-                    print(f"  Processed {sample_idx}/{n_samples} samples...")
-
-        # Apply smoothing (unchanged)
-        smoothing = self.config['smoothing_factor']
-        for i in range(1, n_features + 1):
-            for j in range(1, resol + 1):
-                for l in range(1, n_features + 1):
-                    for m in range(1, resol + 1):
-                        for k in range(1, self.outnodes + 1):
-                            self.global_anti_net[i, j, l, m, k] += smoothing
-                        self.global_anti_net[i, j, l, m, 0] += smoothing * self.outnodes
-
-        self.likelihoods_computed = True
-        computation_time = time.time() - start_time
-        print(f"✅ Global likelihoods computed in {computation_time:.2f}s")
-
-        return self.training_features_norm
-
-    @staticmethod
-    @jit(nopython=True, parallel=True, nogil=True)
-    def _compute_probabilities_numba(global_anti_net, anti_wts, features_norm, bins,
-                                   n_features, outnodes, missing_value):
-        """NUMBA-optimized probability computation"""
-        n_samples = features_norm.shape[0]
-        probabilities = np.zeros((n_samples, outnodes))
-
-        for sample_idx in prange(n_samples):
-            log_probs = np.zeros(outnodes + 2)
-
-            for i in range(n_features):
-                feature_i = i + 1
-                bin_i = bins[sample_idx, i] + 1
-
-                if features_norm[sample_idx, i] == missing_value:
-                    continue
-
-                for l in range(n_features):
-                    feature_l = l + 1
-                    bin_l = bins[sample_idx, l] + 1
-
-                    if features_norm[sample_idx, l] == missing_value:
-                        continue
-
-                    for k in range(1, outnodes + 1):
-                        if global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] > 0:
-                            likelihood = (global_anti_net[feature_i, bin_i, feature_l, bin_l, k] /
-                                        global_anti_net[feature_i, bin_i, feature_l, bin_l, 0])
-                        else:
-                            likelihood = 1.0 / outnodes
-
-                        weight = anti_wts[feature_i, bin_i, feature_l, bin_l, k]
-
-                        if likelihood > 0 and weight > 0:
-                            log_probs[k] += np.log(likelihood) + np.log(weight)
-
-            max_log = np.max(log_probs[1:outnodes+1])
-            total = 0.0
-
-            for k in range(1, outnodes + 1):
-                prob = np.exp(log_probs[k] - max_log)
-                probabilities[sample_idx, k-1] = prob
-                total += prob
-
-            if total > 0:
-                for k in range(1, outnodes + 1):
-                    probabilities[sample_idx, k-1] /= total
-
-        return probabilities
-
-    def _predict_proba_batch(self, features_norm):
-        """Batch-optimized probability prediction"""
-        n_samples = len(features_norm)
-
-        # Precompute bins for all samples
-        bins = self._find_closest_bins_batch(features_norm)
-
-        # Use NUMBA-optimized computation
-        probabilities = self._compute_probabilities_numba(
-            self.global_anti_net,
-            self.anti_wts,
-            features_norm,
-            bins,
-            self.innodes,
-            self.outnodes,
-            self.config['missing_value_placeholder']
-        )
-
-        return probabilities
-
-    def _fit_encoder_consistent(self):
-        """Fit class encoder - CONSISTENT with preprocessor encoding"""
-        if self.preprocessor.target_encoder is None:
-            raise ValueError("Preprocessor target encoder not fitted")
-
-        # USE THE SAME ENCODING AS THE PREPROCESSOR
-        self.class_to_encoded = self.preprocessor.target_encoder
-        self.encoded_to_class = self.preprocessor.target_decoder
-
-        unique_classes = list(self.class_to_encoded.keys())
-        self.outnodes = len(unique_classes)
-
-        self.dmyclass = np.zeros(self.outnodes + 2, dtype=np.float64)
-        self.dmyclass[0] = 0.2
-
-        for i, original_class in enumerate(unique_classes, 1):
-            self.dmyclass[i] = self.class_to_encoded[original_class]
-
-        print(f"Encoded {self.outnodes} classes: {unique_classes}")
-        print(f"Encoding mapping: {self.class_to_encoded}")
-
-    def initialize_orthogonal_weights(self):
-        """
-        ONE-STEP ORTHOGONALIZATION in Complex Tensor Space
-        Called ONLY during training
-        """
-        if not self.likelihoods_computed:
-            raise ValueError("Must compute global likelihoods first!")
-
-        resol = self.config['resol']
-        n_features = self.innodes
-
-        if self.config['use_complex_tensor'] and self.config['orthogonalize_weights']:
-            print("🎯 Performing ONE-STEP orthogonalization in complex space...")
-
-            # Initialize complex weights with orthogonal phases
-            self.complex_weights = np.ones(
-                (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
-                dtype=np.complex128
-            )
-
-            # Create orthogonal phases: θ_k = (k-1) * 2π / K
-            phases = np.array([(k-1) * 2 * np.pi / self.outnodes
-                             for k in range(1, self.outnodes + 1)])
-            complex_phases = np.exp(1j * phases)
-
-            print(f"Orthogonal phases: {[f'{p*180/np.pi:.1f}°' for p in phases]}")
-
-            # Apply orthogonal phases to all weight positions
-            for i in range(1, n_features + 1):
-                for j in range(1, resol + 1):
-                    for l in range(1, n_features + 1):
-                        for m in range(1, resol + 1):
-                            for k in range(1, self.outnodes + 1):
-                                self.complex_weights[i, j, l, m, k] = complex_phases[k-1]
-
-            # Convert to real weights (magnitude) - STORE FOR CONSISTENT PREDICTION
-            self.anti_wts = np.abs(self.complex_weights)
-
-        else:
-            # Fallback: standard initialization
-            self.anti_wts = np.ones(
-                (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
-                dtype=np.float64
-            )
-
-        print("✅ Orthogonal weights initialized")
-
-    def compute_class_probabilities(self, features_norm, sample_idx):
-        """
-        MAINTAINED FOR COMPATIBILITY: Enhanced probability computation
-        Uses optimized batch processing internally when possible
-        """
-        # Handle different types of sample_idx input
-        if hasattr(sample_idx, '__len__'):
-            # sample_idx is an array or list of indices - use batch processing
-            sample_data = features_norm[sample_idx]
-            batch_probs = self._predict_proba_batch(sample_data)
-
-            # Convert to classval format for compatibility
-            classvals = []
-            for prob in batch_probs:
-                classval = np.ones(self.outnodes + 2)
-                classval[1:self.outnodes+1] = prob
-                classval[0] = 0.0
-                classvals.append(classval)
-
-            return np.array(classvals)
-
-        else:
-            # sample_idx is a single integer index
-            if isinstance(sample_idx, int) and sample_idx >= 0:
-                # Use batch processing for single sample for efficiency
-                sample_data = features_norm[sample_idx:sample_idx+1]
-                batch_probs = self._predict_proba_batch(sample_data)
-                classval = np.ones(self.outnodes + 2)
-                classval[1:self.outnodes+1] = batch_probs[0]
-                classval[0] = 0.0
-                return classval
-            else:
-                # Fallback to original method for edge cases
-                return self._compute_class_probabilities_single(features_norm[sample_idx])
-    def train(self, features_train, targets_train):
-        """
-        ONE-STEP TRAINING with orthogonal weight initialization
-        Computes and stores ALL model parameters
-        """
-        if not self.likelihoods_computed:
-            raise ValueError("Must compute global likelihoods first!")
-
-        print("🚀 ONE-STEP training with orthogonal weights...")
-        start_time = time.time()
-
-        # Use preprocessed features from likelihood computation
-        if self.training_features_norm is None:
-            raise ValueError("Training features not available. Call compute_global_likelihoods first.")
-
-        # One-step orthogonal weight initialization - STORES WEIGHTS
-        self.initialize_orthogonal_weights()
-
-        # Evaluate training accuracy using precomputed likelihoods and weights
-        n_samples = len(self.training_features_norm)
-        correct_predictions = 0
-        probabilities = []
-
-        for sample_idx in range(n_samples):
-            classval = self.compute_class_probabilities(self.training_features_norm, sample_idx)
-            probabilities.append(classval[1:self.outnodes+1])
-
-            kmax = 1
-            cmax = 0.0
-            for k in range(1, self.outnodes + 1):
-                if classval[k] > cmax:
-                    cmax = classval[k]
-                    kmax = k
-
-            # Use the SAME encoded targets from likelihood computation
-            actual = self.training_targets_encoded[sample_idx]
-            predicted = self.dmyclass[kmax]
-
-            # FIXED: Use proper comparison for arrays
-            if np.abs(actual - predicted) <= self.dmyclass[0]:
-                correct_predictions += 1
-
-        accuracy = (correct_predictions / n_samples) * 100
-
-        self.is_trained = True
-        training_time = time.time() - start_time
-
-        # Store training history
-        self.training_history['training_time'] = training_time
-        self.training_history['train_accuracy'] = accuracy / 100
-
-        # Report confidence statistics
-        probabilities_array = np.array(probabilities)
-        max_probs = np.max(probabilities_array, axis=1)
-        print(f"✅ Training completed in {training_time:.3f}s")
-        print(f"🎯 Accuracy with orthogonal weights: {accuracy:.2f}% ({correct_predictions}/{n_samples})")
-        print(f"📊 Confidence statistics - Min: {np.min(max_probs):.4f}, "
-              f"Max: {np.max(max_probs):.4f}, Mean: {np.mean(max_probs):.4f}")
-
-        return training_time
-
-    def _normalize_features(self, features):
-        """OPTIMIZED: Normalize features using vectorized operations"""
-        if not isinstance(features, np.ndarray):
-            features = np.array(features)
-
-        if not hasattr(self, 'max_val') or self.max_val is None:
-            raise ValueError("Model not trained. Min/max values not available.")
-
-        n_features = self.innodes
-        features_norm = np.zeros_like(features, dtype=np.float64)
-
-        for i in range(n_features):
-            feature_idx = i + 1
-            feature_data = features[:, i]
-
-            missing_mask = feature_data == self.config['missing_value_placeholder']
-            feature_range = self.max_val[feature_idx] - self.min_val[feature_idx]
-
-            if feature_range > 0:
-                normalized = (feature_data - self.min_val[feature_idx]) / feature_range
-                normalized = np.clip(normalized, 0, 1)
-                normalized = normalized * (self.resolution_arr[feature_idx] - 1)
-                normalized[missing_mask] = self.config['missing_value_placeholder']
-                features_norm[:, i] = normalized
-            else:
-                features_norm[:, i] = self.config['missing_value_placeholder'] if np.any(missing_mask) else 0
-
-        return features_norm
-
-    def _find_closest_bins(self, feature_vector):
-        """MAINTAINED FOR COMPATIBILITY: Find closest bins for a feature vector"""
-        # Use the optimized batch method internally
-        bins_batch = self._find_closest_bins_batch(feature_vector.reshape(1, -1))
-        return bins_batch[0]
-
-    def predict_proba(self, features):
-        """OPTIMIZED: Predict class probabilities using parallel processing"""
-        if not self.likelihoods_computed or not self.is_trained:
-            raise ValueError("Model must be trained first!")
-
-        # Preprocess features
-        features_processed = self.preprocessor.transform_features(features)
-        features_norm = self._normalize_features(features_processed)
-        n_samples = len(features_norm)
-
-        print(f"🔮 Predicting probabilities for {n_samples} samples...")
-
-        # Use batch processing for large datasets
-        if n_samples > 1000 and self.config['parallel_processing']:
-            chunk_size = self.config.get('chunk_size', 1000)
-            all_probabilities = []
-
-            for i in range(0, n_samples, chunk_size):
-                chunk_end = min(i + chunk_size, n_samples)
-                chunk_features = features_norm[i:chunk_end]
-
-                chunk_probs = self._predict_proba_batch(chunk_features)
-                all_probabilities.append(chunk_probs)
-
-            probabilities = np.vstack(all_probabilities)
-        else:
-            probabilities = self._predict_proba_batch(features_norm)
-
-        return probabilities
-
-    def _compute_class_probabilities_single(self, sample_data):
-        """Single sample probability computation (for compatibility)"""
-        # This maintains compatibility with the original interface
-        bins = self._find_closest_bins_batch(sample_data.reshape(1, -1))[0]
-        n_features = self.innodes
-
-        classval = np.ones(self.outnodes + 2)
-        log_probs = np.zeros(self.outnodes + 2)
-
-        for i in range(n_features):
-            feature_i = i + 1
-            bin_i = bins[i] + 1
-
-            if sample_data[i] == self.config['missing_value_placeholder']:
-                continue
-
-            for l in range(n_features):
-                feature_l = l + 1
-                bin_l = bins[l] + 1
-
-                if sample_data[l] == self.config['missing_value_placeholder']:
-                    continue
-
-                for k in range(1, self.outnodes + 1):
-                    if self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] > 0:
-                        likelihood = (self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k] /
-                                    self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0])
-                    else:
-                        likelihood = 1.0 / self.outnodes
-
-                    weight = self.anti_wts[feature_i, bin_i, feature_l, bin_l, k]
-
-                    if likelihood > 0 and weight > 0:
-                        log_probs[k] += np.log(likelihood) + np.log(weight)
-
-        max_log = np.max(log_probs[1:self.outnodes+1])
-        for k in range(1, self.outnodes + 1):
-            classval[k] = np.exp(log_probs[k] - max_log)
-
-        total = np.sum(classval[1:self.outnodes+1])
-        if total > 0:
-            for k in range(1, self.outnodes + 1):
-                classval[k] /= total
-
-        classval[0] = 0.0
-        return classval
-
-
-    def predict(self, features):
-        """OPTIMIZED: Predict class labels using batch processing"""
-        probabilities = self.predict_proba(features)
-        predictions_encoded = np.argmax(probabilities, axis=1) + 1
-
-        # Convert encoded predictions back to original class labels
-        predictions = []
-        for pred_enc in predictions_encoded:
-            original_class = self.encoded_to_class.get(float(pred_enc), "Unknown")
-            predictions.append(original_class)
-
-        max_probs = np.max(probabilities, axis=1)
-        print(f"📊 Prediction confidence - Min: {np.min(max_probs):.4f}, "
-              f"Max: {np.max(max_probs):.4f}, Mean: {np.mean(max_probs):.4f}")
-
-        return np.array(predictions)
-
-    def predict_with_confidence(self, features, top_n=3):
-        """
-        Predict with confidence scores and top N predictions
-        Returns: (predictions, probabilities, top_predictions)
-        """
-        probabilities = self.predict_proba(features)
-        n_samples = probabilities.shape[0]
-
-        # Get top predictions
-        top_predictions = []
-        top_confidences = []
-
-        for i in range(n_samples):
-            sample_probs = probabilities[i]
-            # Get indices sorted by probability (descending)
-            sorted_indices = np.argsort(sample_probs)[::-1]
-            # Get top N predictions
-            top_n_indices = sorted_indices[:top_n]
-
-            predictions_list = []
-            confidences_list = []
-
-            for idx in top_n_indices:
-                if sample_probs[idx] > 0:  # Only include meaningful predictions
-                    class_label = self.encoded_to_class.get(float(idx + 1), "Unknown")
-                    predictions_list.append(class_label)
-                    confidences_list.append(sample_probs[idx])
-
-            top_predictions.append(predictions_list)
-            top_confidences.append(confidences_list)
-
-        # Get primary prediction (highest probability)
-        primary_predictions = self.predict(features)
-
-        return primary_predictions, probabilities, top_predictions, top_confidences
-
-    def evaluate(self, features, targets):
-        """Evaluate model accuracy using CONSISTENT label handling"""
-        # Get predictions (already in original labels)
-        predictions = self.predict(features)
-
-        # Convert targets to original labels for comparison
-        targets_original = self.preprocessor.inverse_transform_targets(
-            self.preprocessor.transform_targets(targets)
-        )
-
-        # FIXED: Ensure both are 1D arrays for comparison
-        predictions = np.array(predictions).flatten()
-        targets_original = np.array(targets_original).flatten()
-
-        accuracy = accuracy_score(targets_original, predictions)
-        self.training_history['test_accuracy'] = accuracy
-
-        print(f"🔍 Evaluation Details:")
-        print(f"   Predictions sample: {predictions[:10]}")
-        print(f"   Actual targets sample: {targets_original[:10]}")
-        print(f"   Match count: {np.sum(predictions == targets_original)}/{len(predictions)}")
-
-        return accuracy
-
-    def plot_feature_importance(self):
-        """Plot feature importance using original feature names"""
-        if not self.is_trained:
-            print("Model not trained yet")
-            return
-
-        try:
-            n_features = self.innodes
-            feature_importance = np.zeros(n_features)
-
-            for i in range(n_features):
-                # Simple measure: sum of likelihoods for each feature
-                feature_importance[i] = np.sum(self.global_anti_net[i+1, :, :, :, :])
-
-            # Normalize
-            feature_importance = feature_importance / np.sum(feature_importance)
-
-            # Use original feature names if available
-            if self.feature_names is not None and len(self.feature_names) == n_features:
-                feature_labels = self.feature_names
-            else:
-                feature_labels = [f'Feature {i+1}' for i in range(n_features)]
-
-            # Plot
-            fig, ax = plt.subplots(figsize=(10, 6))
-            y_pos = np.arange(len(feature_labels))
-
-            bars = ax.barh(y_pos, feature_importance)
-            ax.set_yticks(y_pos)
-            ax.set_yticklabels(feature_labels)
-            ax.set_xlabel('Importance Score')
-            ax.set_title('Feature Importance (Based on Global Likelihoods)')
-
-            # Add value annotations
-            for i, bar in enumerate(bars):
-                width = bar.get_width()
-                ax.text(width + 0.01, bar.get_y() + bar.get_height()/2,
-                       f'{width:.3f}', ha='left', va='center')
-
-            plt.tight_layout()
-            plt.show()
-
-        except Exception as e:
-            print(f"Error plotting feature importance: {e}")
-
-    def save_model(self, filepath):
-        """Save the complete model state including hyperparameters and encoders"""
-        model_state = {
-            'config': self.config,
-            'preprocessor': self.preprocessor,
-            'global_anti_net': self.global_anti_net,
-            'binloc': self.binloc,
-            'max_val': self.max_val,
-            'min_val': self.min_val,
-            'dmyclass': self.dmyclass,
-            'resolution_arr': self.resolution_arr,
-            'anti_wts': self.anti_wts,
-            'complex_weights': self.complex_weights,
-            'innodes': self.innodes,
-            'outnodes': self.outnodes,
-            'class_to_encoded': self.class_to_encoded,
-            'encoded_to_class': self.encoded_to_class,
-            'is_trained': self.is_trained,
-            'likelihoods_computed': self.likelihoods_computed,
-            'feature_names': self.feature_names,  # Store actual feature names
-            'target_name': self.target_name,
-            'training_features_norm': self.training_features_norm,
-            'training_targets_encoded': self.training_targets_encoded,
-            'training_history': self.training_history,
-            'model_metadata': self.model_metadata,
-            'selected_features': self.selected_features,
-            'target_column_name': self.target_column_name
-        }
-
-        with open(filepath, 'wb') as f:
-            pickle.dump(model_state, f)
-
-        # Also save hyperparameters separately for easy access
-        hp_filepath = filepath.replace('.pkl', '_hp.json').replace('.bin', '_hp.json')
-        with open(hp_filepath, 'w') as f:
-            json.dump(self.config, f, indent=2)
-
-        print(f"✅ Model saved to {filepath}")
-        print(f"✅ Feature names: {self.feature_names}")
-
-    def load_model(self, filepath):
-        """Load complete model state including hyperparameters and encoders"""
-        with open(filepath, 'rb') as f:
-            model_state = pickle.load(f)
-
-        # Restore all attributes
-        for key, value in model_state.items():
-            setattr(self, key, value)
-
-        print(f"✅ Model loaded from {filepath}")
-        print(f"📊 Model info: {self.model_metadata['data_name']}, "
-              f"Trained: {self.is_trained}, Features: {self.innodes}, Classes: {self.outnodes}")
-        print(f"📊 Feature names: {self.feature_names}")
-
-    def save_hyperparameters(self, filepath=None):
-        """Save hyperparameters to JSON file"""
-        if filepath is None:
-            data_name = self.model_metadata.get('data_name', 'unknown')
-            filepath = f"{data_name}_hp.json"
-
-        with open(filepath, 'w') as f:
-            json.dump(self.config, f, indent=2)
-
-        print(f"✅ Hyperparameters saved to {filepath}")
-        return filepath
-
-    def load_hyperparameters(self, filepath):
-        """Load hyperparameters from JSON file"""
-        with open(filepath, 'r') as f:
-            loaded_config = json.load(f)
-
-        self.config.update(loaded_config)
-        print(f"✅ Hyperparameters loaded from {filepath}")
-        return self.config
-
-    def predict_on_file(self, filepath, output_file=None, features_to_use=None, has_target=False, target_column=None):
-        """
-        Comprehensive prediction on file with feature selection
-        USES EXACT FEATURE NAMES AND ORDERING FROM TRAINING
-        """
-        try:
-            # Load data
-            df = pd.read_csv(filepath)
-            original_columns = df.columns.tolist()
-
-            print(f"📊 Prediction file columns: {original_columns}")
-            print(f"📊 Model feature names: {self.feature_names}")
-
-            # Determine features to use - ALWAYS USE MODEL'S FEATURE NAMES IN TRAINING ORDER
-            if features_to_use is None:
-                features_to_use = self.feature_names  # Use exact feature names from training
-
-            # Remove target column if specified
-            if target_column and target_column in features_to_use:
-                features_to_use = [f for f in features_to_use if f != target_column]
-
-            # STRICT FEATURE MATCHING: Use exact feature names and ordering from training
-            available_features = []
-            missing_features = []
-
-            for feature in features_to_use:
-                if feature in df.columns:
-                    available_features.append(feature)
-                else:
-                    missing_features.append(feature)
-
-            if missing_features:
-                print(f"❌ Missing features in prediction file: {missing_features}")
-                print(f"   Available features: {df.columns.tolist()}")
-                raise ValueError(f"Missing features in prediction file: {missing_features}")
-
-            if len(available_features) != len(features_to_use):
-                print(f"❌ Feature count mismatch. Expected: {len(features_to_use)}, Found: {len(available_features)}")
-                raise ValueError(f"Feature count mismatch. Expected: {len(features_to_use)}, Found: {len(available_features)}")
-
-            print(f"✅ All {len(available_features)} features matched by exact names")
-            print(f"🔧 Using features in training order: {available_features}")
-
-            # Extract features for prediction - IN EXACT TRAINING ORDER
-            prediction_features = df[available_features]
-
-            print(f"🔮 Making predictions using {len(available_features)} features")
-            print(f"   Features used (in training order): {available_features}")
-
-            # Make predictions
-            primary_predictions, probabilities, top_predictions, top_confidences = self.predict_with_confidence(prediction_features, top_n=3)
-
-            # Create results dataframe
-            results_df = df.copy()
-
-            # Add prediction columns
-            results_df['Prediction'] = primary_predictions
-            results_df['Confidence'] = [max(probs) for probs in probabilities]
-
-            # Add top 3 predictions with confidences
-            for i in range(3):
-                pred_col = f'Top_{i+1}_Prediction'
-                conf_col = f'Top_{i+1}_Confidence'
-
-                pred_values = []
-                conf_values = []
-
-                for j in range(len(top_predictions)):
-                    if i < len(top_predictions[j]):
-                        pred_values.append(top_predictions[j][i])
-                        conf_values.append(top_confidences[j][i])
-                    else:
-                        pred_values.append(None)
-                        conf_values.append(None)
-
-                results_df[pred_col] = pred_values
-                results_df[conf_col] = conf_values
-
-            # Sort by confidence (descending)
-            results_df = results_df.sort_values('Confidence', ascending=False)
-
-            # Save results
-            if output_file is None:
-                base_name = os.path.splitext(filepath)[0]
-                output_file = f"{base_name}_predictions.csv"
-
-            results_df.to_csv(output_file, index=False)
-            print(f"✅ Predictions saved to {output_file}")
-            print(f"📊 Results include: {len(available_features)} features, {len(results_df)} samples")
-            print(f"🎯 Confidence range: {results_df['Confidence'].min():.3f} - {results_df['Confidence'].max():.3f}")
-
-            return results_df
-
-        except Exception as e:
-            print(f"❌ Error during prediction: {e}")
-            print(f"🔍 Debug info:")
-            print(f"   File: {filepath}")
-            print(f"   Model features: {self.feature_names}")
-            if 'df' in locals():
-                print(f"   File columns: {df.columns.tolist()}")
-            raise
-
-
-def main():
-    """Main function with command-line interface - UPDATED with optional split"""
-    parser = argparse.ArgumentParser(
-        description="Enhanced CT-DBNN Classifier with Comprehensive Prediction System",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Run with GUI
-  python ct_dbnn_enhanced.py --gui
-
-  # Train on Iris dataset with no test split (use all data for training)
-  python ct_dbnn_enhanced.py --dataset iris --train
-
-  # Train with 80% training data, 20% testing
-  python ct_dbnn_enhanced.py --dataset iris --train --train-split 80
-
-  # Train with custom parameters and no test split
-  python ct_dbnn_enhanced.py --csv data.csv --features col1,col2,col3 --target outcome --train --no-split
-
-  # Load and evaluate model
-  python ct_dbnn_enhanced.py --load-model model.pkl --evaluate
-
-  # Predict on new data
-  python ct_dbnn_enhanced.py --load-model model.pkl --predict new_data.csv
-        """
-    )
-
-    # Data options
-    data_group = parser.add_argument_group('Data Options')
-    data_group.add_argument('--dataset', help='UCI dataset to use (name from repository or custom)')
-    data_group.add_argument('--csv', help='Custom CSV file path')
-    data_group.add_argument('--features', help='Comma-separated list of features to use for training/prediction')
-    data_group.add_argument('--target', help='Target column name')
-
-    # Model options
-    model_group = parser.add_argument_group('Model Options')
-    model_group.add_argument('--resol', type=int, default=8,
-                           help='Resolution for feature discretization (default: 8)')
-    model_group.add_argument('--no-complex-tensor', action='store_true',
-                           help='Disable complex tensor operations')
-    model_group.add_argument('--no-orthogonal-weights', action='store_true',
-                           help='Disable orthogonal weight initialization')
-    model_group.add_argument('--smoothing-factor', type=float, default=1e-8,
-                           help='Smoothing factor for probabilities (default: 1e-8)')
-    model_group.add_argument('--no-parallel', action='store_true',
-                           help='Disable parallel processing')
-    model_group.add_argument('--n-jobs', type=int, default=-1,
-                           help='Number of parallel jobs (default: -1 for all)')
-
-    # Training options
-    training_group = parser.add_argument_group('Training Options')
-    training_group.add_argument('--train', action='store_true', help='Train model on dataset')
-    training_group.add_argument('--no-split', action='store_true',
-                               help='Use all data for training (no test split)')
-    training_group.add_argument('--train-split', type=float, default=80,
-                               help='Percentage of data to use for training (default: 80)')
-    training_group.add_argument('--evaluate', action='store_true',
-                               help='Evaluate model on test set (requires train/test split)')
-
-    # Operation modes
-    operation_group = parser.add_argument_group('Operation Modes')
-    operation_group.add_argument('--gui', action='store_true',
-                               help='Launch GUI interface')
-    operation_group.add_argument('--load-model', help='Load model from file')
-    operation_group.add_argument('--save-model', help='Save model to file')
-    operation_group.add_argument('--save-hp', help='Save hyperparameters to JSON file')
-    operation_group.add_argument('--load-hp', help='Load hyperparameters from JSON file')
-
-    # Prediction options
-    pred_group = parser.add_argument_group('Prediction Options')
-    pred_group.add_argument('--predict', help='Run prediction on specified file')
-    pred_group.add_argument('--has-target', action='store_true',
-                          help='Input file has target column (will be ignored for prediction)')
-    pred_group.add_argument('--target-col', help='Target column name in prediction file')
-
-    # Additional options
-    parser.add_argument('--random-state', type=int, default=42,
-                       help='Random state for reproducibility (default: 42)')
-
-    args = parser.parse_args()
-
-    # GUI mode
-    if args.gui:
-        if not GUI_AVAILABLE:
-            print("GUI libraries not available. Please install tkinter, matplotlib, and pandas.")
-            return 1
-
-        app = EnhancedGUI()
-        app.run()
-        return 0
-
-    # Command-line mode - Prediction
-    if args.predict:
-        if not args.load_model:
-            print("❌ Please specify --load-model for prediction")
-            return 1
-
-        model = ParallelCTDBNN()
-        model.load_model(args.load_model)
-
-        features_to_use = None
-        if args.features:
-            features_to_use = [f.strip() for f in args.features.split(',')]
-
-        try:
-            results_df = model.predict_on_file(
-                filepath=args.predict,
-                features_to_use=features_to_use,
-                has_target=args.has_target,
-                target_column=args.target_col
-            )
-            print(f"✅ Prediction completed. Results saved to: {args.predict.replace('.csv', '_predictions.csv')}")
-            return 0
-        except Exception as e:
-            print(f"❌ Prediction failed: {e}")
-            return 1
-
-    # Command-line mode - Load existing model
-    if args.load_model:
-        model = ParallelCTDBNN()
-        model.load_model(args.load_model)
-
-        if args.evaluate:
-            if hasattr(model, 'X_test') and model.X_test is not None:
-                accuracy = model.evaluate(model.X_test, model.y_test)
-                print(f"Test accuracy: {accuracy:.3f}")
-            else:
-                print("❌ Cannot evaluate: No test data available in loaded model")
-
-        if args.save_model:
-            model.save_model(args.save_model)
-
-        return 0
-
-    # Training mode
-    if args.dataset or args.csv:
-        config = {
-            'resol': args.resol,
-            'use_complex_tensor': not args.no_complex_tensor,
-            'orthogonalize_weights': not args.no_orthogonal_weights,
-            'smoothing_factor': args.smoothing_factor,
-            'parallel_processing': not args.no_parallel,
-            'n_jobs': args.n_jobs
-        }
-
-        # Load data
-        if args.dataset:
-            print(f"Loading dataset: {args.dataset}")
-            if args.dataset == "iris":
-                data = load_iris()
-            elif args.dataset == "wine":
-                data = load_wine()
-            elif args.dataset == "breast_cancer":
-                data = load_breast_cancer()
-            elif args.dataset == "diabetes":
-                info = UCI_DATASETS["diabetes"]
-                df = UCIDatasetLoader.download_uci_data(info)
-                data = type('DiabetesData', (), {})()
-                data.data = df.iloc[:, :-1].values
-                data.target = df.iloc[:, -1].values
-            else:
-                info = UCIDatasetLoader.load_any_uci_dataset(args.dataset)
-                if info:
-                    df = UCIDatasetLoader.download_uci_data(info)
-                    if df is not None:
-                        data = type('CustomData', (), {})()
-                        data.data = df.iloc[:, :-1].values
-                        data.target = df.iloc[:, -1].values
-                    else:
-                        print(f"Could not download dataset: {args.dataset}")
-                        return 1
-                else:
-                    print(f"Dataset {args.dataset} not found")
-                    return 1
-
-            features = data.data
-            targets = data.target
-
-        elif args.csv:
-            if not args.target:
-                print("Please specify --target for CSV files")
-                return 1
-
-            print(f"Loading CSV: {args.csv}")
-            df = pd.read_csv(args.csv)
-
-            if args.features:
-                features_to_use = [f.strip() for f in args.features.split(',')]
-                missing_features = [f for f in features_to_use if f not in df.columns]
-                if missing_features:
-                    print(f"❌ Missing features: {missing_features}")
-                    return 1
-                features = df[features_to_use].values
-            else:
-                features_to_use = [col for col in df.columns if col != args.target]
-                features = df[features_to_use].values
-
-            targets = df[args.target].values
-            feature_names = features_to_use if args.features else [col for col in df.columns if col != args.target]
-
-        # Handle train/test split based on arguments
-        if args.no_split:
-            X_train = features
-            y_train = targets
-            X_test = None
-            y_test = None
-            print("✅ Using 100% of data for training (no test split)")
-            print(f"   Training samples: {len(X_train)}")
-        else:
-            test_size = (100 - args.train_split) / 100.0
-            X_train, X_test, y_train, y_test = train_test_split(
-                features, targets,
-                test_size=test_size,
-                random_state=args.random_state,
-                stratify=targets
-            )
-            print(f"✅ Data split: {args.train_split}% training, {100-args.train_split}% testing")
-            print(f"   Training samples: {len(X_train)}")
-            print(f"   Testing samples: {len(X_test)}")
-
-        # Initialize and train model
-        model = ParallelCTDBNN(config)
-
-        if 'feature_names' in locals():
-            model.feature_names = feature_names
-            model.selected_features = feature_names
-            model.target_column_name = args.target
-
-        print("Computing global likelihoods...")
-        model.compute_global_likelihoods(X_train, y_train, feature_names if 'feature_names' in locals() else None)
-
-        if args.train:
-            print("Training model...")
-            model.train(X_train, y_train)
-
-            if args.evaluate:
-                if X_test is not None and y_test is not None:
-                    accuracy = model.evaluate(X_test, y_test)
-                    print(f"Test accuracy: {accuracy:.3f}")
-                else:
-                    print("❌ Cannot evaluate: No test data available (use --train-split instead of --no-split)")
-
-        if args.save_model:
-            model.save_model(args.save_model)
-
-        if args.save_hp:
-            model.save_hyperparameters(args.save_hp)
-
-    elif args.load_hp:
-        model = ParallelCTDBNN()
-        model.load_hyperparameters(args.load_hp)
-        print(f"Loaded hyperparameters: {model.config}")
-
-    else:
-        parser.print_help()
-
-    return 0
-
 
 class EnhancedGUI:
     """
@@ -3170,6 +1494,2004 @@ Top 5 Predictions (by confidence):
         else:
             print("GUI not available. Use command-line interface.")
 
+
+class UCIDatasetLoader:
+    """Loader for fetching any UCI dataset by name"""
+
+    @staticmethod
+    def fetch_dataset_info(dataset_name):
+        """Fetch dataset information from UCI repository"""
+        try:
+            # Try to find dataset in UCI repository
+            base_url = "https://archive.ics.uci.edu/ml/machine-learning-databases/"
+            dataset_urls = [
+                f"{base_url}{dataset_name}/{dataset_name}.data",
+                f"{base_url}{dataset_name.replace('-', '_')}/{dataset_name.replace('-', '_')}.data",
+                f"{base_url}{dataset_name}/data.csv",
+                f"{base_url}{dataset_name.replace('-', '_')}/data.csv"
+            ]
+
+            for url in dataset_urls:
+                try:
+                    response = urllib.request.urlopen(url)
+                    if response.status == 200:
+                        return {
+                            "name": dataset_name.replace('_', ' ').title(),
+                            "url": url,
+                            "description": f"UCI {dataset_name} dataset",
+                            "features": "Unknown",
+                            "samples": "Unknown",
+                            "best_accuracy": "Unknown",
+                            "reference": "UCI Repository"
+                        }
+                except:
+                    continue
+
+            return None
+        except Exception as e:
+            print(f"Error fetching dataset info: {e}")
+            return None
+
+    @staticmethod
+    def load_any_uci_dataset(dataset_name):
+        """Load any UCI dataset by name"""
+        try:
+            # First try predefined datasets
+            if dataset_name in UCI_DATASETS:
+                return UCI_DATASETS[dataset_name]
+
+            # Try to fetch from UCI repository
+            info = UCIDatasetLoader.fetch_dataset_info(dataset_name)
+            if info:
+                return info
+            else:
+                # Try common variations
+                variations = [
+                    dataset_name,
+                    dataset_name.replace('-', ''),
+                    dataset_name.replace('_', ''),
+                    dataset_name.replace('-', '_'),
+                    dataset_name.replace('_', '-')
+                ]
+
+                for var in variations:
+                    info = UCIDatasetLoader.fetch_dataset_info(var)
+                    if info:
+                        return info
+
+            return None
+
+        except Exception as e:
+            print(f"Error loading UCI dataset: {e}")
+            return None
+
+    @staticmethod
+    def download_uci_data(dataset_info):
+        """Download and parse UCI dataset data"""
+        try:
+            url = dataset_info['url']
+            response = urllib.request.urlopen(url)
+            content = response.read().decode('utf-8')
+
+            # Try to parse as CSV
+            try:
+                # Try different delimiters
+                for delimiter in [',', '\t', ';', ' ']:
+                    try:
+                        from io import StringIO
+                        df = pd.read_csv(StringIO(content), delimiter=delimiter, header=None)
+                        if df.shape[1] > 1:  # Valid dataset with multiple columns
+                            return df
+                    except:
+                        continue
+            except:
+                pass
+
+            # If CSV parsing fails, try space-separated
+            lines = content.strip().split('\n')
+            data = []
+            for line in lines:
+                if line.strip() and not line.startswith('@') and not line.startswith('#'):
+                    # Clean the line and split by whitespace
+                    cleaned_line = re.sub(r'\s+', ' ', line.strip())
+                    row = cleaned_line.split(' ')
+                    # Filter out empty strings
+                    row = [x for x in row if x]
+                    if row:
+                        data.append(row)
+
+            if data:
+                # Find maximum columns
+                max_cols = max(len(row) for row in data)
+                # Pad rows with fewer columns
+                for i, row in enumerate(data):
+                    if len(row) < max_cols:
+                        data[i] = row + [np.nan] * (max_cols - len(row))
+
+                return pd.DataFrame(data)
+            else:
+                return None
+
+        except Exception as e:
+            print(f"Error downloading UCI data: {e}")
+            return None
+
+
+class DataPreprocessor:
+    """
+    Comprehensive data preprocessing with CONSISTENT label encoding
+    ALWAYS preserves and uses original feature names - NO DUMMY NAMES
+    """
+    def __init__(self, missing_value_placeholder=-99999):
+        self.missing_value_placeholder = missing_value_placeholder
+        self.feature_encoders = {}  # encoders for each feature column
+        self.target_encoder = None  # encoder for target column
+        self.target_decoder = None  # decoder for target column
+        self.feature_columns = None  # Store original feature names
+        self.target_column = None
+        self.original_dtypes = {}
+        self.is_fitted = False
+
+    def fit_transform_features(self, features, feature_names=None):
+        """Fit and transform features with label encoding and missing value handling"""
+        if isinstance(features, pd.DataFrame):
+            # ALWAYS use DataFrame column names - PRESERVE ORIGINAL NAMES
+            self.feature_columns = list(features.columns)
+            print(f"🔧 Using DataFrame column names: {self.feature_columns}")
+            result = self._fit_transform_dataframe(features)
+        elif isinstance(features, np.ndarray):
+            # FORCE use of provided feature names - NO DUMMY NAMES
+            if feature_names is not None:
+                self.feature_columns = feature_names
+                print(f"🔧 Using provided feature names: {self.feature_columns}")
+            else:
+                # If no names provided, try to extract from the data object
+                n_features = features.shape[1]
+                if hasattr(features, 'columns'):
+                    self.feature_columns = list(features.columns)
+                    print(f"🔧 Using data.columns: {self.feature_columns}")
+                elif hasattr(features, 'feature_names'):
+                    self.feature_columns = features.feature_names
+                    print(f"🔧 Using data.feature_names: {self.feature_columns}")
+                elif hasattr(features, 'feature_names_in_'):
+                    # For newer sklearn datasets
+                    self.feature_columns = list(features.feature_names_in_)
+                    print(f"🔧 Using data.feature_names_in_: {self.feature_columns}")
+                else:
+                    # LAST RESORT: Use descriptive names that indicate source
+                    self.feature_columns = [f'Feature_{i+1}' for i in range(n_features)]
+                    print(f"⚠️  No feature names found. Using: {self.feature_columns}")
+            result = self._fit_transform_array(features)
+        else:
+            # Convert to numpy array and process
+            features_array = np.array(features)
+            if feature_names is not None:
+                self.feature_columns = feature_names
+                print(f"🔧 Using provided feature names: {self.feature_columns}")
+            else:
+                n_features = features_array.shape[1]
+                self.feature_columns = [f'Feature_{i+1}' for i in range(n_features)]
+                print(f"⚠️  No feature names provided. Using: {self.feature_columns}")
+            result = self._fit_transform_array(features_array)
+
+        self.is_fitted = True
+        return result
+
+    def _fit_transform_dataframe(self, df):
+        """Fit and transform DataFrame features - PRESERVE ORIGINAL COLUMN NAMES"""
+        self.feature_columns = list(df.columns)
+        self.original_dtypes = df.dtypes.to_dict()
+
+        processed_data = df.copy()
+        self.feature_encoders = {}
+
+        for col in df.columns:
+            # Handle missing values
+            if df[col].isna().any():
+                processed_data[col] = df[col].fillna(self.missing_value_placeholder)
+
+            # Convert to numeric if possible, otherwise use label encoding
+            if df[col].dtype == 'object' or isinstance(df[col].dtype, pd.CategoricalDtype):
+                # Label encoding for categorical data
+                unique_vals = processed_data[col].unique()
+                encoder = {val: idx for idx, val in enumerate(unique_vals)}
+                self.feature_encoders[col] = encoder
+                processed_data[col] = processed_data[col].map(encoder)
+            else:
+                # Keep numeric data as is, but store identity encoder
+                self.feature_encoders[col] = 'numeric'
+
+        return processed_data.values.astype(np.float64)
+
+    def _fit_transform_array(self, array):
+        """Fit and transform numpy array features - USE ORIGINAL FEATURE NAMES"""
+        processed_data = array.copy().astype(object)
+        n_samples, n_features = array.shape
+
+        # CRITICAL: Use stored feature columns - NO DUMMY NAMES
+        if self.feature_columns is None:
+            self.feature_columns = [f'Column_{i+1}' for i in range(n_features)]
+            print(f"⚠️  No feature columns set. Using: {self.feature_columns}")
+
+        self.feature_encoders = {}
+
+        for col_idx in range(n_features):
+            col_name = self.feature_columns[col_idx]
+            col_data = array[:, col_idx]
+
+            # Handle missing values
+            missing_mask = pd.isna(col_data) if hasattr(pd, 'isna') else (
+                (col_data == None) | ((isinstance(col_data, str)) & ((col_data == 'NaN') | (col_data == 'NA') | (col_data == '')))
+            )
+            if np.any(missing_mask):
+                processed_data[missing_mask, col_idx] = self.missing_value_placeholder
+
+            # Check if column needs encoding (non-numeric)
+            try:
+                # Try to convert to numeric
+                numeric_data = pd.to_numeric(processed_data[:, col_idx], errors='coerce')
+                non_numeric_mask = pd.isna(numeric_data)
+                if np.any(non_numeric_mask):
+                    # Contains non-numeric values, need encoding
+                    unique_vals = np.unique(processed_data[:, col_idx])
+                    encoder = {val: idx for idx, val in enumerate(unique_vals)}
+                    self.feature_encoders[col_name] = encoder  # Use column name as key
+                    for i, val in enumerate(processed_data[:, col_idx]):
+                        processed_data[i, col_idx] = encoder.get(val, 0)
+                else:
+                    # All numeric
+                    processed_data[:, col_idx] = numeric_data
+                    self.feature_encoders[col_name] = 'numeric'  # Use column name as key
+            except:
+                # Fallback: treat as categorical
+                unique_vals = np.unique(processed_data[:, col_idx])
+                encoder = {val: idx for idx, val in enumerate(unique_vals)}
+                self.feature_encoders[col_name] = encoder  # Use column name as key
+                for i, val in enumerate(processed_data[:, col_idx]):
+                    processed_data[i, col_idx] = encoder.get(val, 0)
+
+        return processed_data.astype(np.float64)
+
+    def transform_features(self, features):
+        """Transform features using fitted encoders - HANDLE COLUMN NAMES PROPERLY"""
+        if not self.is_fitted:
+            raise ValueError("Preprocessor must be fitted first")
+
+        if isinstance(features, pd.DataFrame):
+            return self._transform_dataframe(features)
+        elif isinstance(features, np.ndarray):
+            return self._transform_array(features)
+        else:
+            features_array = np.array(features)
+            return self._transform_array(features_array)
+
+    def _transform_dataframe(self, df):
+        """Transform DataFrame features using fitted encoders - USE EXACT TRAINING COLUMN NAMES AND ORDER"""
+        processed_data = df.copy()
+
+        # CRITICAL: Check if all required columns are present
+        missing_columns = []
+        for fitted_col in self.feature_columns:  # Use stored feature columns in training order
+            if fitted_col not in df.columns:
+                missing_columns.append(fitted_col)
+
+        if missing_columns:
+            raise ValueError(f"Missing columns in prediction data: {missing_columns}. "
+                           f"Available columns: {list(df.columns)}. "
+                           f"Expected columns (in training order): {self.feature_columns}")
+
+        # Process only the columns that were fitted, in the exact training order
+        for col in self.feature_columns:
+            # Handle missing values
+            if df[col].isna().any():
+                processed_data[col] = df[col].fillna(self.missing_value_placeholder)
+
+            # Apply encoding if needed
+            if self.feature_encoders[col] != 'numeric':
+                encoder = self.feature_encoders[col]
+                processed_data[col] = processed_data[col].map(
+                    lambda x: encoder.get(x, 0) if x in encoder else 0
+                )
+
+        # Ensure we return only the columns that were fitted, in the CORRECT TRAINING ORDER
+        processed_data = processed_data[self.feature_columns]
+        return processed_data.values.astype(np.float64)
+
+    def _transform_array(self, array):
+        """Transform numpy array features using fitted encoders"""
+        processed_data = array.copy().astype(object)
+        n_samples, n_features = array.shape
+
+        # Check if number of features matches
+        if n_features != len(self.feature_columns):
+            raise ValueError(f"Number of features ({n_features}) doesn't match fitted features ({len(self.feature_columns)})")
+
+        for col_idx in range(n_features):
+            col_name = self.feature_columns[col_idx]
+
+            if col_name not in self.feature_encoders:
+                raise ValueError(f"Column '{col_name}' not seen during fitting. Available columns: {list(self.feature_encoders.keys())}")
+
+            col_data = array[:, col_idx]
+
+            # Handle missing values
+            missing_mask = pd.isna(col_data) if hasattr(pd, 'isna') else (
+                (col_data == None) | ((isinstance(col_data, str)) & ((col_data == 'NaN') | (col_data == 'NA') | (col_data == '')))
+            )
+            if np.any(missing_mask):
+                processed_data[missing_mask, col_idx] = self.missing_value_placeholder
+
+            # Apply encoding if needed
+            if self.feature_encoders[col_name] != 'numeric':
+                encoder = self.feature_encoders[col_name]
+                for i, val in enumerate(processed_data[:, col_idx]):
+                    processed_data[i, col_idx] = encoder.get(val, 0)
+            else:
+                # Convert to numeric
+                try:
+                    processed_data[:, col_idx] = pd.to_numeric(processed_data[:, col_idx], errors='coerce')
+                    processed_data[pd.isna(processed_data[:, col_idx]), col_idx] = self.missing_value_placeholder
+                except:
+                    processed_data[:, col_idx] = self.missing_value_placeholder
+
+        return processed_data.astype(np.float64)
+
+    def fit_transform_targets(self, targets):
+        """Fit and transform targets with label encoding - STORE BOTH ENCODER AND DECODER"""
+        targets_data = self._extract_targets(targets)
+        self.target_encoder = {}
+        self.target_decoder = {}
+
+        unique_vals = np.unique(targets_data)
+        for idx, val in enumerate(unique_vals):
+            encoded_val = float(idx + 1)
+            self.target_encoder[val] = encoded_val
+            self.target_decoder[encoded_val] = val
+
+        encoded = np.array([self.target_encoder[val] for val in targets_data])
+        return encoded.astype(np.float64)
+
+    def transform_targets(self, targets):
+        """Transform targets using fitted encoder"""
+        if self.target_encoder is None:
+            raise ValueError("Target encoder not fitted")
+
+        targets_data = self._extract_targets(targets)
+        encoded = np.array([self.target_encoder.get(val, 0.0) for val in targets_data])
+        return encoded.astype(np.float64)
+
+    def inverse_transform_targets(self, encoded_targets):
+        """Convert encoded targets back to original labels"""
+        if self.target_decoder is None:
+            raise ValueError("Target decoder not fitted")
+
+        if isinstance(encoded_targets, (pd.Series, pd.DataFrame)):
+            original = encoded_targets.map(lambda x: self.target_decoder.get(x, "Unknown"))
+        else:
+            original = np.array([self.target_decoder.get(x, "Unknown") for x in encoded_targets])
+
+        return original
+
+    def _extract_targets(self, targets):
+        """Extract targets array from various input types"""
+        if isinstance(targets, np.ndarray):
+            return targets
+        elif isinstance(targets, pd.Series):
+            return targets.values
+        elif isinstance(targets, pd.DataFrame):
+            return targets.values.flatten()
+        else:
+            try:
+                return np.array(targets)
+            except:
+                raise ValueError(f"Unsupported targets type: {type(targets)}")
+
+    def get_feature_info(self):
+        """Get information about feature encoding"""
+        info = {
+            'missing_value_placeholder': self.missing_value_placeholder,
+            'feature_encoders': {},
+            'target_encoder': self.target_encoder,
+            'target_decoder': self.target_decoder,
+            'is_fitted': self.is_fitted
+        }
+
+        for col, encoder in self.feature_encoders.items():
+            if encoder == 'numeric':
+                info['feature_encoders'][col] = 'numeric'
+            else:
+                info['feature_encoders'][col] = {
+                    'type': 'categorical',
+                    'mapping': encoder,
+                    'num_categories': len(encoder)
+                }
+
+        return info
+
+    def get_feature_names(self):
+        """Get original feature names"""
+        return self.feature_columns
+
+    def __getstate__(self):
+        """Return state for pickling"""
+        state = self.__dict__.copy()
+        return state
+
+    def __setstate__(self, state):
+        """Restore state from pickling"""
+        self.__dict__.update(state)
+
+
+class ParallelCTDBNN:
+    """
+    Optimized CT-DBNN with CONSISTENT label handling across all operations
+    ALWAYS uses original feature names - NO DUMMY NAMES
+    NOW WITH INCREMENTAL LEARNING SUPPORT AND FREEZE MECHANISM
+    """
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = {
+            'resol': 8,
+            'use_complex_tensor': True,
+            'orthogonalize_weights': True,
+            'smoothing_factor': 1e-8,
+            'parallel_processing': True,
+            'n_jobs': -1,
+            'batch_size': 1000,
+            'missing_value_placeholder': -99999,
+            'use_gpu': False,
+            'chunk_size': 1000,
+            'freeze_likelihoods': True,  # NEW: Default freeze state
+            'freeze_weights': False,      # NEW: Default weights un-freeze state
+        }
+        if config:
+            self.config.update(config)
+
+        # Data preprocessor
+        self.preprocessor = DataPreprocessor(
+            missing_value_placeholder=self.config['missing_value_placeholder']
+        )
+
+        # Determine number of workers
+        if self.config['n_jobs'] == -1:
+            self.n_jobs = mp.cpu_count()
+        else:
+            self.n_jobs = min(self.config['n_jobs'], mp.cpu_count())
+
+        # Check GPU availability
+        self.gpu_available = self.config['use_gpu'] and self._check_gpu_availability()
+
+        print(f"🔄 Parallel processing: {self.n_jobs} workers")
+        if self.gpu_available:
+            print("🎯 GPU acceleration: ENABLED")
+        else:
+            print("🎯 GPU acceleration: DISABLED")
+
+        # FREEZE STATUS
+        print(f"🔒 Likelihood freeze: {'ENABLED' if self.config['freeze_likelihoods'] else 'DISABLED'}")
+        print(f"🔒 Weight freeze: {'ENABLED' if self.config['freeze_weights'] else 'DISABLED'}")
+
+        # Global data structures - NOW SUPPORTS INCREMENTAL UPDATES
+        self.global_anti_net = None
+        self.binloc = None
+        self.max_val = None
+        self.min_val = None
+        self.dmyclass = None
+        self.resolution_arr = None
+
+        # Weight structures
+        self.anti_wts = None
+        self.complex_weights = None
+
+        # State
+        self.innodes = 0
+        self.outnodes = 0
+        self.class_to_encoded = None
+        self.encoded_to_class = None
+        self.is_trained = False
+        self.likelihoods_computed = False
+
+        # Feature names for proper output
+        self.feature_names = None
+        self.target_name = None
+
+        # Training history - NOW TRACKS INCREMENTAL UPDATES
+        self.training_history = {
+            'training_time': 0,
+            'train_accuracy': 0,
+            'test_accuracy': 0,
+            'config': self.config.copy(),
+            'incremental_updates': 0,  # NEW: Track incremental updates
+            'total_training_samples': 0,  # NEW: Track total samples seen
+            'initial_training_time': None,  # NEW: Track initial training
+        }
+
+        # Store normalized training features for consistent processing
+        self.training_features_norm = None
+        self.training_targets_encoded = None
+
+        # Model metadata
+        self.model_metadata = {
+            'creation_time': time.time(),
+            'version': '1.0.0',
+            'data_name': 'unknown_dataset',
+            'freeze_status': self.config['freeze_likelihoods'],  # NEW: Store freeze status
+        }
+
+        # Feature selection
+        self.selected_features = None
+        self.target_column_name = None
+
+    def _check_gpu_availability(self):
+        """Check if GPU is available for acceleration"""
+        try:
+            import cupy as cp
+            cp.zeros(1)  # Test GPU allocation
+            return True
+        except:
+            return False
+
+    def set_freeze_state(self, freeze_likelihoods: bool = None, freeze_weights: bool = None):
+        """Set the freeze state for likelihood computation and weights"""
+        if freeze_likelihoods is not None:
+            old_lh_state = self.config['freeze_likelihoods']
+            self.config['freeze_likelihoods'] = freeze_likelihoods
+            self.model_metadata['freeze_status'] = freeze_likelihoods
+
+            if old_lh_state != freeze_likelihoods:
+                if freeze_likelihoods:
+                    print("🔒 Likelihood freeze: ENABLED (likelihoods will be preserved)")
+                else:
+                    print("🔓 Likelihood freeze: DISABLED (likelihoods can be updated)")
+
+        if freeze_weights is not None:
+            old_wt_state = self.config['freeze_weights']
+            self.config['freeze_weights'] = freeze_weights
+
+            if old_wt_state != freeze_weights:
+                if freeze_weights:
+                    print("🔒 Weight freeze: ENABLED (weights will be preserved)")
+                else:
+                    print("🔓 Weight freeze: DISABLED (weights can be updated)")
+
+        return self.config['freeze_likelihoods'], self.config['freeze_weights']
+
+    def unfreeze_likelihoods(self):
+        """Convenience method to unfreeze likelihoods"""
+        return self.set_freeze_state(freeze_likelihoods=False)
+
+    def freeze_likelihoods(self):
+        """Convenience method to freeze likelihoods"""
+        return self.set_freeze_state(freeze_likelihoods=True)
+
+    def unfreeze_weights(self):
+        """Convenience method to unfreeze weights"""
+        return self.set_freeze_state(freeze_weights=False)
+
+    def freeze_weights(self):
+        """Convenience method to freeze weights"""
+        return self.set_freeze_state(freeze_weights=True)
+
+    def get_freeze_state(self):
+        """Get current freeze state"""
+        return self.config['freeze_likelihoods'], self.config['freeze_weights']
+
+    def _initialize_likelihood_structure(self, n_features, resol):
+        """Initialize the likelihood structure if not exists"""
+        if self.global_anti_net is None:
+            self.global_anti_net = np.zeros(
+                (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
+                dtype=np.float64, order='C'
+            )
+            print("✅ Initialized new likelihood structure")
+        else:
+            # Check if dimensions match
+            existing_dims = self.global_anti_net.shape
+            expected_dims = (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2)
+
+            if existing_dims != expected_dims:
+                print(f"⚠️  Likelihood structure dimensions mismatch. Reinitializing...")
+                print(f"   Existing: {existing_dims}, Expected: {expected_dims}")
+                self.global_anti_net = np.zeros(expected_dims, dtype=np.float64, order='C')
+            else:
+                print("✅ Using existing likelihood structure for incremental update")
+
+    def _fit_encoder_consistent(self):
+        """Fit class encoder - CONSISTENT with preprocessor encoding"""
+        if self.preprocessor.target_encoder is None:
+            raise ValueError("Preprocessor target encoder not fitted")
+
+        # USE THE SAME ENCODING AS THE PREPROCESSOR
+        self.class_to_encoded = self.preprocessor.target_encoder
+        self.encoded_to_class = self.preprocessor.target_decoder
+
+        unique_classes = list(self.class_to_encoded.keys())
+        self.outnodes = len(unique_classes)
+
+        self.dmyclass = np.zeros(self.outnodes + 2, dtype=np.float64)
+        self.dmyclass[0] = 0.2
+
+        for i, original_class in enumerate(unique_classes, 1):
+            self.dmyclass[i] = self.class_to_encoded[original_class]
+
+        print(f"Encoded {self.outnodes} classes: {unique_classes}")
+        print(f"Encoding mapping: {self.class_to_encoded}")
+
+    def _normalize_features(self, features):
+        """OPTIMIZED: Normalize features using vectorized operations"""
+        if not isinstance(features, np.ndarray):
+            features = np.array(features)
+
+        if not hasattr(self, 'max_val') or self.max_val is None:
+            raise ValueError("Model not trained. Min/max values not available.")
+
+        n_features = self.innodes
+        features_norm = np.zeros_like(features, dtype=np.float64)
+
+        for i in range(n_features):
+            feature_idx = i + 1
+            feature_data = features[:, i]
+
+            missing_mask = feature_data == self.config['missing_value_placeholder']
+            feature_range = self.max_val[feature_idx] - self.min_val[feature_idx]
+
+            if feature_range > 0:
+                normalized = (feature_data - self.min_val[feature_idx]) / feature_range
+                normalized = np.clip(normalized, 0, 1)
+                normalized = normalized * (self.resolution_arr[feature_idx] - 1)
+                normalized[missing_mask] = self.config['missing_value_placeholder']
+                features_norm[:, i] = normalized
+            else:
+                features_norm[:, i] = self.config['missing_value_placeholder'] if np.any(missing_mask) else 0
+
+        return features_norm
+
+    @staticmethod
+    @jit(nopython=True, parallel=True, nogil=True)
+    def _compute_bins_numba(features_norm, binloc, resolution_arr, n_features, missing_value):
+        """NUMBA-optimized bin computation"""
+        n_samples = features_norm.shape[0]
+        bins = np.zeros((n_samples, n_features), dtype=np.int32)
+
+        for sample_idx in prange(n_samples):
+            for i in range(n_features):
+                value = features_norm[sample_idx, i]
+                if value == missing_value:
+                    bins[sample_idx, i] = 0
+                    continue
+
+                feature_idx = i + 1
+                resolution_val = resolution_arr[feature_idx]
+                min_dist = 2.0 * resolution_val
+                best_bin = 0
+
+                for j in range(1, resolution_val + 1):
+                    dist = abs(value - binloc[feature_idx, j])
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_bin = j
+
+                if best_bin > 0:
+                    best_bin -= 1
+
+                bins[sample_idx, i] = best_bin
+
+        return bins
+
+    def _find_closest_bins_batch(self, features_norm):
+        """Batch-optimized bin finding using NUMBA"""
+        if not hasattr(self, 'resolution_arr') or self.resolution_arr is None:
+            raise ValueError("Model not properly initialized")
+
+        n_samples, n_features = features_norm.shape
+
+        # Use NUMBA-optimized function for CPU
+        bins = self._compute_bins_numba(
+            features_norm,
+            self.binloc,
+            self.resolution_arr,
+            n_features,
+            self.config['missing_value_placeholder']
+        )
+
+        return bins
+
+    def _build_likelihoods_chunk(self, chunk_data):
+        """Process a chunk of data for likelihood computation"""
+        chunk_indices, features_norm, targets_encoded = chunk_data
+        n_features = self.innodes
+        resol = self.config['resol']
+
+        # Initialize local anti_net for this chunk
+        local_anti_net = np.zeros(
+            (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
+            dtype=np.float64
+        )
+
+        for sample_idx in chunk_indices:
+            sample_data = features_norm[sample_idx, :]
+            missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
+
+            if missing_count >= n_features:
+                continue
+
+            bins = self._find_closest_bins_batch(sample_data.reshape(1, -1))[0]
+
+            for i in range(n_features):
+                feature_i = i + 1
+                bin_i = bins[i] + 1
+
+                if features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
+                    continue
+
+                for l in range(n_features):
+                    feature_l = l + 1
+                    bin_l = bins[l] + 1
+
+                    if features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
+                        continue
+
+                    k_class = 1
+                    while (k_class <= self.outnodes and
+                           abs(targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
+                        k_class += 1
+
+                    if k_class <= self.outnodes:
+                        local_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
+                        local_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
+
+        return local_anti_net
+
+    def compute_likelihoods_only(self, features, targets, feature_names=None):
+        """
+        NEW: Compute likelihoods only without training - for initialization
+        """
+        print("🔧 Computing likelihoods only (no training)...")
+        start_time = time.time()
+
+        # Store original freeze state
+        original_freeze_lh, original_freeze_wt = self.get_freeze_state()
+
+        # Temporarily unfreeze for likelihood computation
+        self.set_freeze_state(freeze_likelihoods=False, freeze_weights=True)
+
+        try:
+            result = self.compute_global_likelihoods(features, targets, feature_names, incremental=False)
+
+            # Restore original freeze state
+            self.set_freeze_state(freeze_likelihoods=original_freeze_lh, freeze_weights=original_freeze_wt)
+
+            computation_time = time.time() - start_time
+            print(f"✅ Likelihoods computed in {computation_time:.2f}s")
+            print(f"📊 Total training samples: {self.training_history['total_training_samples']}")
+            print(f"🔒 Freeze status restored: LH={original_freeze_lh}, WT={original_freeze_wt}")
+
+            return result
+        except Exception as e:
+            # Restore original freeze state on error
+            self.set_freeze_state(freeze_likelihoods=original_freeze_lh, freeze_weights=original_freeze_wt)
+            raise e
+
+    def compute_global_likelihoods(self, features, targets, feature_names=None, incremental=False):
+        """
+        ENHANCED: Compute global likelihoods with support for incremental updates
+        """
+        # Determine if this should be incremental based on freeze state and existing likelihoods
+        should_be_incremental = incremental and self.likelihoods_computed and not self.config['freeze_likelihoods']
+
+        if self.likelihoods_computed and self.config['freeze_likelihoods'] and not incremental:
+            print("🔒 Likelihoods are FROZEN. Using existing likelihoods.")
+            print("   Use --unfreeze to enable likelihood updates or incremental=True parameter")
+            return self.training_features_norm
+
+        print(f"Computing {'INCREMENTAL ' if should_be_incremental else ''}GLOBAL likelihoods...")
+        start_time = time.time()
+
+        # Original preprocessing logic
+        actual_feature_names = None
+        if hasattr(features, 'columns'):
+            actual_feature_names = list(features.columns)
+        elif feature_names is not None:
+            actual_feature_names = feature_names
+        elif hasattr(features, 'feature_names'):
+            actual_feature_names = features.feature_names
+        elif hasattr(features, 'feature_names_in_'):
+            actual_feature_names = list(features.feature_names_in_)
+        else:
+            n_features = features.shape[1] if hasattr(features, 'shape') else len(features[0])
+            actual_feature_names = [f'Feature_{i+1}' for i in range(n_features)]
+
+        features_processed = self.preprocessor.fit_transform_features(features, actual_feature_names)
+        targets_encoded = self.preprocessor.fit_transform_targets(targets)
+        self.feature_names = self.preprocessor.get_feature_names()
+
+        n_samples, n_features = features_processed.shape
+        self.innodes = n_features
+        resol = self.config['resol']
+
+        print(f"Data shape: {features_processed.shape}, Resolution: {resol}")
+        print(f"✅ ACTUAL Feature names: {self.feature_names}")
+
+        self._fit_encoder_consistent()
+
+        # Initialize arrays for normalization (only if first time or dimensions change)
+        if not should_be_incremental or self.max_val is None:
+            self.max_val = np.zeros(n_features + 2, dtype=np.float64)
+            self.min_val = np.zeros(n_features + 2, dtype=np.float64)
+            self.resolution_arr = np.zeros(n_features + 8, dtype=np.int32)
+            self.binloc = np.zeros((n_features + 2, resol + 8), dtype=np.float64)
+
+            for i in range(n_features):
+                feature_idx = i + 1
+                feature_data = features_processed[:, i]
+                valid_mask = feature_data != self.config['missing_value_placeholder']
+                valid_data = feature_data[valid_mask]
+
+                if len(valid_data) > 0:
+                    self.max_val[feature_idx] = np.max(valid_data)
+                    self.min_val[feature_idx] = np.min(valid_data)
+                else:
+                    self.max_val[feature_idx] = 1.0
+                    self.min_val[feature_idx] = 0.0
+
+                self.resolution_arr[feature_idx] = resol
+                for j in range(1, resol + 1):
+                    self.binloc[feature_idx][j] = (j - 1) * 1.0
+
+        features_norm = self._normalize_features(features_processed)
+
+        # Initialize or use existing likelihood structure
+        self._initialize_likelihood_structure(n_features, resol)
+
+        if should_be_incremental:
+            print(f"🔄 Performing INCREMENTAL update with {n_samples} new samples")
+            print(f"   Previous samples: {self.training_history['total_training_samples']}")
+        else:
+            print(f"🔄 Building {'FROZEN ' if self.config['freeze_likelihoods'] else ''}likelihoods from {n_samples} samples...")
+
+        # Store training data for reference
+        if should_be_incremental:
+            # For incremental updates, append to existing data
+            if self.training_features_norm is not None:
+                self.training_features_norm = np.vstack([self.training_features_norm, features_norm])
+                self.training_targets_encoded = np.concatenate([self.training_targets_encoded, targets_encoded])
+            else:
+                self.training_features_norm = features_norm
+                self.training_targets_encoded = targets_encoded
+        else:
+            # For fresh computation, replace data
+            self.training_features_norm = features_norm
+            self.training_targets_encoded = targets_encoded
+
+        # PARALLEL PROCESSING FOR LIKELIHOOD COMPUTATION
+        incremental_anti_net = np.zeros_like(self.global_anti_net) if should_be_incremental else self.global_anti_net
+
+        if self.config['parallel_processing'] and n_samples > 100:
+            print(f"🔄 Using parallel processing with {self.n_jobs} workers...")
+
+            chunk_size = self.config.get('chunk_size', 1000)
+            chunks = []
+            for i in range(0, n_samples, chunk_size):
+                chunk_indices = list(range(i, min(i + chunk_size, n_samples)))
+                chunks.append((chunk_indices, features_norm, targets_encoded))
+
+            with ProcessPoolExecutor(max_workers=self.n_jobs) as executor:
+                futures = [executor.submit(self._build_likelihoods_chunk, chunk) for chunk in chunks]
+
+                for future in as_completed(futures):
+                    chunk_result = future.result()
+                    if should_be_incremental:
+                        incremental_anti_net += chunk_result
+                    else:
+                        self.global_anti_net += chunk_result
+
+        else:
+            # Sequential fallback for small datasets
+            print("🔁 Using sequential processing...")
+            valid_samples = 0
+
+            for sample_idx in range(n_samples):
+                sample_data = features_norm[sample_idx, :]
+                missing_count = np.sum(sample_data == self.config['missing_value_placeholder'])
+
+                if missing_count >= n_features:
+                    continue
+
+                valid_samples += 1
+                bins = self._find_closest_bins_batch(sample_data.reshape(1, -1))[0]
+
+                for i in range(n_features):
+                    feature_i = i + 1
+                    bin_i = bins[i] + 1
+
+                    if features_norm[sample_idx, i] == self.config['missing_value_placeholder']:
+                        continue
+
+                    for l in range(n_features):
+                        feature_l = l + 1
+                        bin_l = bins[l] + 1
+
+                        if features_norm[sample_idx, l] == self.config['missing_value_placeholder']:
+                            continue
+
+                        k_class = 1
+                        while (k_class <= self.outnodes and
+                               abs(targets_encoded[sample_idx] - self.dmyclass[k_class]) > self.dmyclass[0]):
+                            k_class += 1
+
+                        if k_class <= self.outnodes:
+                            if should_be_incremental:
+                                incremental_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
+                                incremental_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
+                            else:
+                                self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k_class] += 1
+                                self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] += 1
+
+                if sample_idx > 0 and sample_idx % 1000 == 0:
+                    print(f"  Processed {sample_idx}/{n_samples} samples...")
+
+        # Apply smoothing and update global structure
+        smoothing = self.config['smoothing_factor']
+
+        if should_be_incremental:
+            # Add incremental updates to global structure
+            self.global_anti_net += incremental_anti_net
+            print(f"✅ Applied incremental update: {n_samples} samples added")
+        else:
+            # Apply smoothing to fresh computation
+            for i in range(1, n_features + 1):
+                for j in range(1, resol + 1):
+                    for l in range(1, n_features + 1):
+                        for m in range(1, resol + 1):
+                            for k in range(1, self.outnodes + 1):
+                                self.global_anti_net[i, j, l, m, k] += smoothing
+                            self.global_anti_net[i, j, l, m, 0] += smoothing * self.outnodes
+
+        # Update training history
+        if should_be_incremental:
+            self.training_history['incremental_updates'] += 1
+            self.training_history['total_training_samples'] += n_samples
+        else:
+            self.training_history['total_training_samples'] = n_samples
+            self.training_history['initial_training_time'] = time.time() - start_time
+            self.training_history['incremental_updates'] = 0
+
+        self.likelihoods_computed = True
+        computation_time = time.time() - start_time
+
+        print(f"✅ {'Incremental ' if should_be_incremental else ''}Global likelihoods computed in {computation_time:.2f}s")
+        print(f"📊 Total training samples: {self.training_history['total_training_samples']}")
+        print(f"📈 Incremental updates: {self.training_history['incremental_updates']}")
+        print(f"🔒 Freeze status: LH={'FROZEN' if self.config['freeze_likelihoods'] else 'UNFROZEN'}, WT={'FROZEN' if self.config['freeze_weights'] else 'UNFROZEN'}")
+
+        return self.training_features_norm
+
+    def incremental_train(self, features, targets, feature_names=None):
+        """
+        INCREMENTAL TRAINING: Update likelihoods with new data while preserving existing knowledge
+        Only works when freeze is disabled
+        """
+        if self.config['freeze_likelihoods']:
+            print("❌ Cannot perform incremental training: Likelihoods are FROZEN")
+            print("   Use unfreeze_likelihoods() or --unfreeze command line option")
+            return None
+
+        if not self.likelihoods_computed:
+            print("⚠️  No existing likelihoods found. Performing initial training...")
+            return self.compute_global_likelihoods(features, targets, feature_names, incremental=False)
+
+        print("🔄 Starting INCREMENTAL training...")
+        return self.compute_global_likelihoods(features, targets, feature_names, incremental=True)
+
+    def initialize_orthogonal_weights(self):
+        """
+        ONE-STEP ORTHOGONALIZATION in Complex Tensor Space
+        Called ONLY during training - weights are reset to uniform before orthogonalization
+        """
+        if not self.likelihoods_computed:
+            raise ValueError("Must compute global likelihoods first!")
+
+        print("🎯 RESETTING weights to uniform before orthogonalization...")
+
+        resol = self.config['resol']
+        n_features = self.innodes
+
+        # CRITICAL FIX: ALWAYS reset weights to uniform (1.0) before orthogonalization
+        # This ensures each training episode starts fresh
+        self.anti_wts = np.ones(
+            (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
+            dtype=np.float64
+        )
+
+        if self.config['use_complex_tensor'] and self.config['orthogonalize_weights']:
+            print("🎯 Performing ONE-STEP orthogonalization in complex space...")
+
+            # Initialize complex weights with orthogonal phases
+            self.complex_weights = np.ones(
+                (n_features + 2, resol + 2, n_features + 2, resol + 2, self.outnodes + 2),
+                dtype=np.complex128
+            )
+
+            # Create orthogonal phases: θ_k = (k-1) * 2π / K
+            phases = np.array([(k-1) * 2 * np.pi / self.outnodes
+                             for k in range(1, self.outnodes + 1)])
+            complex_phases = np.exp(1j * phases)
+
+            print(f"Orthogonal phases: {[f'{p*180/np.pi:.1f}°' for p in phases]}")
+
+            # Apply orthogonal phases to all weight positions
+            for i in range(1, n_features + 1):
+                for j in range(1, resol + 1):
+                    for l in range(1, n_features + 1):
+                        for m in range(1, resol + 1):
+                            for k in range(1, self.outnodes + 1):
+                                self.complex_weights[i, j, l, m, k] = complex_phases[k-1]
+
+            # Convert to real weights (magnitude) - STORE FOR CONSISTENT PREDICTION
+            self.anti_wts = np.abs(self.complex_weights)
+
+        print("✅ Weights reset to uniform and orthogonalized for current training episode")
+
+    def train(self, features_train, targets_train, incremental=False):
+        """
+        ENHANCED TRAINING: Support both one-time and incremental training
+        NOW PROPERLY RESETS WEIGHTS for each training episode while keeping LH frozen
+        """
+        if incremental:
+            return self.incremental_train(features_train, targets_train)
+
+        if not self.likelihoods_computed:
+            raise ValueError("Must compute global likelihoods first!")
+
+        print("🚀 ROUND 0 TRAINING: Resetting weights to uniform, keeping LH frozen...")
+        start_time = time.time()
+
+        # Use preprocessed features from likelihood computation
+        if self.training_features_norm is None:
+            raise ValueError("Training features not available. Call compute_global_likelihoods first.")
+
+        # CRITICAL FIX: ALWAYS reset weights to uniform before orthogonalization
+        # This ensures each training episode starts with fresh weights
+        # while likelihoods remain frozen from previous computation
+        self.initialize_orthogonal_weights()
+
+        # Evaluate training accuracy with reset weights
+        n_samples = len(self.training_features_norm)
+        correct_predictions = 0
+        probabilities = []
+
+        for sample_idx in range(n_samples):
+            classval = self.compute_class_probabilities(self.training_features_norm, sample_idx)
+            probabilities.append(classval[1:self.outnodes+1])
+
+            kmax = 1
+            cmax = 0.0
+            for k in range(1, self.outnodes + 1):
+                if classval[k] > cmax:
+                    cmax = classval[k]
+                    kmax = k
+
+            actual = self.training_targets_encoded[sample_idx]
+            predicted = self.dmyclass[kmax]
+
+            if np.abs(actual - predicted) <= self.dmyclass[0]:
+                correct_predictions += 1
+
+        accuracy = (correct_predictions / n_samples) * 100
+
+        self.is_trained = True
+        training_time = time.time() - start_time
+
+        # Store training history
+        self.training_history['training_time'] = training_time
+        self.training_history['train_accuracy'] = accuracy / 100
+
+        # Report statistics
+        probabilities_array = np.array(probabilities)
+        max_probs = np.max(probabilities_array, axis=1)
+        print(f"✅ ROUND 0 Training completed in {training_time:.3f}s")
+        print(f"🎯 Accuracy with reset orthogonal weights: {accuracy:.2f}% ({correct_predictions}/{n_samples})")
+        print(f"📊 Confidence statistics - Min: {np.min(max_probs):.4f}, "
+              f"Max: {np.max(max_probs):.4f}, Mean: {np.mean(max_probs):.4f}")
+        print(f"🔒 LH FROZEN: {self.config['freeze_likelihoods']}, WT RESET: ✅")
+
+        return training_time
+
+    @staticmethod
+    @jit(nopython=True, parallel=True, nogil=True)
+    def _compute_probabilities_numba(global_anti_net, anti_wts, features_norm, bins,
+                                   n_features, outnodes, missing_value):
+        """NUMBA-optimized probability computation"""
+        n_samples = features_norm.shape[0]
+        probabilities = np.zeros((n_samples, outnodes))
+
+        for sample_idx in prange(n_samples):
+            log_probs = np.zeros(outnodes + 2)
+
+            for i in range(n_features):
+                feature_i = i + 1
+                bin_i = bins[sample_idx, i] + 1
+
+                if features_norm[sample_idx, i] == missing_value:
+                    continue
+
+                for l in range(n_features):
+                    feature_l = l + 1
+                    bin_l = bins[sample_idx, l] + 1
+
+                    if features_norm[sample_idx, l] == missing_value:
+                        continue
+
+                    for k in range(1, outnodes + 1):
+                        if global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] > 0:
+                            likelihood = (global_anti_net[feature_i, bin_i, feature_l, bin_l, k] /
+                                        global_anti_net[feature_i, bin_i, feature_l, bin_l, 0])
+                        else:
+                            likelihood = 1.0 / outnodes
+
+                        weight = anti_wts[feature_i, bin_i, feature_l, bin_l, k]
+
+                        if likelihood > 0 and weight > 0:
+                            log_probs[k] += np.log(likelihood) + np.log(weight)
+
+            max_log = np.max(log_probs[1:outnodes+1])
+            total = 0.0
+
+            for k in range(1, outnodes + 1):
+                prob = np.exp(log_probs[k] - max_log)
+                probabilities[sample_idx, k-1] = prob
+                total += prob
+
+            if total > 0:
+                for k in range(1, outnodes + 1):
+                    probabilities[sample_idx, k-1] /= total
+
+        return probabilities
+
+    def _predict_proba_batch(self, features_norm):
+        """Batch-optimized probability prediction"""
+        n_samples = len(features_norm)
+
+        # Precompute bins for all samples
+        bins = self._find_closest_bins_batch(features_norm)
+
+        # Use NUMBA-optimized computation
+        probabilities = self._compute_probabilities_numba(
+            self.global_anti_net,
+            self.anti_wts,
+            features_norm,
+            bins,
+            self.innodes,
+            self.outnodes,
+            self.config['missing_value_placeholder']
+        )
+
+        return probabilities
+
+    def compute_class_probabilities(self, features_norm, sample_idx):
+        """
+        MAINTAINED FOR COMPATIBILITY: Enhanced probability computation
+        Uses optimized batch processing internally when possible
+        """
+        # Handle different types of sample_idx input
+        if hasattr(sample_idx, '__len__'):
+            # sample_idx is an array or list of indices - use batch processing
+            sample_data = features_norm[sample_idx]
+            batch_probs = self._predict_proba_batch(sample_data)
+
+            # Convert to classval format for compatibility
+            classvals = []
+            for prob in batch_probs:
+                classval = np.ones(self.outnodes + 2)
+                classval[1:self.outnodes+1] = prob
+                classval[0] = 0.0
+                classvals.append(classval)
+
+            return np.array(classvals)
+
+        else:
+            # sample_idx is a single integer index
+            if isinstance(sample_idx, int) and sample_idx >= 0:
+                # Use batch processing for single sample for efficiency
+                sample_data = features_norm[sample_idx:sample_idx+1]
+                batch_probs = self._predict_proba_batch(sample_data)
+                classval = np.ones(self.outnodes + 2)
+                classval[1:self.outnodes+1] = batch_probs[0]
+                classval[0] = 0.0
+                return classval
+            else:
+                # Fallback to original method for edge cases
+                return self._compute_class_probabilities_single(features_norm[sample_idx])
+
+    def _compute_class_probabilities_single(self, sample_data):
+        """Single sample probability computation (for compatibility)"""
+        # This maintains compatibility with the original interface
+        bins = self._find_closest_bins_batch(sample_data.reshape(1, -1))[0]
+        n_features = self.innodes
+
+        classval = np.ones(self.outnodes + 2)
+        log_probs = np.zeros(self.outnodes + 2)
+
+        for i in range(n_features):
+            feature_i = i + 1
+            bin_i = bins[i] + 1
+
+            if sample_data[i] == self.config['missing_value_placeholder']:
+                continue
+
+            for l in range(n_features):
+                feature_l = l + 1
+                bin_l = bins[l] + 1
+
+                if sample_data[l] == self.config['missing_value_placeholder']:
+                    continue
+
+                for k in range(1, self.outnodes + 1):
+                    if self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0] > 0:
+                        likelihood = (self.global_anti_net[feature_i, bin_i, feature_l, bin_l, k] /
+                                    self.global_anti_net[feature_i, bin_i, feature_l, bin_l, 0])
+                    else:
+                        likelihood = 1.0 / self.outnodes
+
+                    weight = self.anti_wts[feature_i, bin_i, feature_l, bin_l, k]
+
+                    if likelihood > 0 and weight > 0:
+                        log_probs[k] += np.log(likelihood) + np.log(weight)
+
+        max_log = np.max(log_probs[1:self.outnodes+1])
+        for k in range(1, self.outnodes + 1):
+            classval[k] = np.exp(log_probs[k] - max_log)
+
+        total = np.sum(classval[1:self.outnodes+1])
+        if total > 0:
+            for k in range(1, self.outnodes + 1):
+                classval[k] /= total
+
+        classval[0] = 0.0
+        return classval
+
+    def _enforce_prediction_freeze(self):
+        """Enforce freeze during prediction/testing"""
+        if not self.config['freeze_weights']:
+            print("🔒 Auto-freezing weights for prediction...")
+            self.config['freeze_weights'] = True
+
+        if not self.config['freeze_likelihoods']:
+            print("🔒 Auto-freezing likelihoods for prediction...")
+            self.config['freeze_likelihoods'] = True
+
+    def predict_proba(self, features):
+        """OPTIMIZED: Predict class probabilities using parallel processing"""
+        # ENFORCE FREEZE DURING PREDICTION
+        self._enforce_prediction_freeze()
+
+        if not self.likelihoods_computed or not self.is_trained:
+            raise ValueError("Model must be trained first!")
+
+        # Preprocess features
+        features_processed = self.preprocessor.transform_features(features)
+        features_norm = self._normalize_features(features_processed)
+        n_samples = len(features_norm)
+
+        print(f"🔮 Predicting probabilities for {n_samples} samples...")
+
+        # Use batch processing for large datasets
+        if n_samples > 1000 and self.config['parallel_processing']:
+            chunk_size = self.config.get('chunk_size', 1000)
+            all_probabilities = []
+
+            for i in range(0, n_samples, chunk_size):
+                chunk_end = min(i + chunk_size, n_samples)
+                chunk_features = features_norm[i:chunk_end]
+
+                chunk_probs = self._predict_proba_batch(chunk_features)
+                all_probabilities.append(chunk_probs)
+
+            probabilities = np.vstack(all_probabilities)
+        else:
+            probabilities = self._predict_proba_batch(features_norm)
+
+        return probabilities
+
+    def predict(self, features):
+        """OPTIMIZED: Predict class labels using batch processing"""
+        # ENFORCE FREEZE DURING PREDICTION
+        self._enforce_prediction_freeze()
+        probabilities = self.predict_proba(features)
+        predictions_encoded = np.argmax(probabilities, axis=1) + 1
+
+        # Convert encoded predictions back to original class labels
+        predictions = []
+        for pred_enc in predictions_encoded:
+            original_class = self.encoded_to_class.get(float(pred_enc), "Unknown")
+            predictions.append(original_class)
+
+        max_probs = np.max(probabilities, axis=1)
+        print(f"📊 Prediction confidence - Min: {np.min(max_probs):.4f}, "
+              f"Max: {np.max(max_probs):.4f}, Mean: {np.mean(max_probs):.4f}")
+
+        return np.array(predictions)
+
+    def predict_with_confidence(self, features, top_n=3):
+        """
+        Predict with confidence scores and top N predictions
+        Returns: (predictions, probabilities, top_predictions)
+        """
+        probabilities = self.predict_proba(features)
+        n_samples = probabilities.shape[0]
+
+        # Get top predictions
+        top_predictions = []
+        top_confidences = []
+
+        for i in range(n_samples):
+            sample_probs = probabilities[i]
+            # Get indices sorted by probability (descending)
+            sorted_indices = np.argsort(sample_probs)[::-1]
+            # Get top N predictions
+            top_n_indices = sorted_indices[:top_n]
+
+            predictions_list = []
+            confidences_list = []
+
+            for idx in top_n_indices:
+                if sample_probs[idx] > 0:  # Only include meaningful predictions
+                    class_label = self.encoded_to_class.get(float(idx + 1), "Unknown")
+                    predictions_list.append(class_label)
+                    confidences_list.append(sample_probs[idx])
+
+            top_predictions.append(predictions_list)
+            top_confidences.append(confidences_list)
+
+        # Get primary prediction (highest probability)
+        primary_predictions = self.predict(features)
+
+        return primary_predictions, probabilities, top_predictions, top_confidences
+
+    def evaluate(self, features, targets):
+        """Evaluate model accuracy using CONSISTENT label handling"""
+        # ENFORCE FREEZE DURING EVALUATION
+        self._enforce_prediction_freeze()
+
+        # Get predictions (already in original labels)
+        predictions = self.predict(features)
+
+        # Convert targets to original labels for comparison
+        targets_original = self.preprocessor.inverse_transform_targets(
+            self.preprocessor.transform_targets(targets)
+        )
+
+        # FIXED: Ensure both are 1D arrays for comparison
+        predictions = np.array(predictions).flatten()
+        targets_original = np.array(targets_original).flatten()
+
+        accuracy = accuracy_score(targets_original, predictions)
+        self.training_history['test_accuracy'] = accuracy
+
+        print(f"🔍 Evaluation Details:")
+        print(f"   Predictions sample: {predictions[:10]}")
+        print(f"   Actual targets sample: {targets_original[:10]}")
+        print(f"   Match count: {np.sum(predictions == targets_original)}/{len(predictions)}")
+
+        return accuracy
+
+    def plot_feature_importance(self):
+        """Plot feature importance using original feature names"""
+        if not self.is_trained:
+            print("Model not trained yet")
+            return
+
+        try:
+            n_features = self.innodes
+            feature_importance = np.zeros(n_features)
+
+            for i in range(n_features):
+                # Simple measure: sum of likelihoods for each feature
+                feature_importance[i] = np.sum(self.global_anti_net[i+1, :, :, :, :])
+
+            # Normalize
+            feature_importance = feature_importance / np.sum(feature_importance)
+
+            # Use original feature names if available
+            if self.feature_names is not None and len(self.feature_names) == n_features:
+                feature_labels = self.feature_names
+            else:
+                feature_labels = [f'Feature {i+1}' for i in range(n_features)]
+
+            # Plot
+            fig, ax = plt.subplots(figsize=(10, 6))
+            y_pos = np.arange(len(feature_labels))
+
+            bars = ax.barh(y_pos, feature_importance)
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(feature_labels)
+            ax.set_xlabel('Importance Score')
+            ax.set_title('Feature Importance (Based on Global Likelihoods)')
+
+            # Add value annotations
+            for i, bar in enumerate(bars):
+                width = bar.get_width()
+                ax.text(width + 0.01, bar.get_y() + bar.get_height()/2,
+                       f'{width:.3f}', ha='left', va='center')
+
+            plt.tight_layout()
+            plt.show()
+
+        except Exception as e:
+            print(f"Error plotting feature importance: {e}")
+
+    def save_model(self, filepath):
+        """Save the complete model state including ALL state variables"""
+        model_state = {
+            'config': self.config,
+            'preprocessor': self.preprocessor,
+            'global_anti_net': self.global_anti_net,  # Save likelihoods
+            'binloc': self.binloc,
+            'max_val': self.max_val,
+            'min_val': self.min_val,
+            'dmyclass': self.dmyclass,
+            'resolution_arr': self.resolution_arr,
+            'anti_wts': self.anti_wts,  # Save weights
+            'complex_weights': self.complex_weights,  # Save complex weights
+            'innodes': self.innodes,
+            'outnodes': self.outnodes,
+            'class_to_encoded': self.class_to_encoded,
+            'encoded_to_class': self.encoded_to_class,
+            'is_trained': self.is_trained,
+            'likelihoods_computed': self.likelihoods_computed,
+            'feature_names': self.feature_names,
+            'target_name': self.target_name,
+            'training_features_norm': self.training_features_norm,
+            'training_targets_encoded': self.training_targets_encoded,
+            'training_history': self.training_history,
+            'model_metadata': self.model_metadata,
+            'selected_features': self.selected_features,
+            'target_column_name': self.target_column_name
+        }
+
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_state, f)
+
+        # Also save hyperparameters separately for easy access
+        hp_filepath = filepath.replace('.pkl', '_hp.json').replace('.bin', '_hp.json')
+        with open(hp_filepath, 'w') as f:
+            json.dump(self.config, f, indent=2)
+
+        print(f"✅ Model saved to {filepath}")
+        print(f"✅ Likelihoods preserved: {self.global_anti_net is not None}")
+        print(f"✅ Weights preserved: {self.anti_wts is not None}")
+        print(f"✅ Feature names: {self.feature_names}")
+
+    def load_model(self, filepath):
+        """Load complete model state including ALL state variables"""
+        with open(filepath, 'rb') as f:
+            model_state = pickle.load(f)
+
+        # Restore all attributes
+        for key, value in model_state.items():
+            setattr(self, key, value)
+
+        print(f"✅ Model loaded from {filepath}")
+        print(f"📊 Model info: {self.model_metadata['data_name']}, "
+              f"Trained: {self.is_trained}, Features: {self.innodes}, Classes: {self.outnodes}")
+        print(f"📊 Likelihoods restored: {self.global_anti_net is not None}")
+        print(f"📊 Weights restored: {self.anti_wts is not None}")
+        print(f"📊 Feature names: {self.feature_names}")
+        print(f"🔒 Freeze status: LH={'FROZEN' if self.config['freeze_likelihoods'] else 'UNFROZEN'}, WT={'FROZEN' if self.config['freeze_weights'] else 'UNFROZEN'}")
+
+    def save_hyperparameters(self, filepath=None):
+        """Save hyperparameters to JSON file"""
+        if filepath is None:
+            data_name = self.model_metadata.get('data_name', 'unknown')
+            filepath = f"{data_name}_hp.json"
+
+        with open(filepath, 'w') as f:
+            json.dump(self.config, f, indent=2)
+
+        print(f"✅ Hyperparameters saved to {filepath}")
+        return filepath
+
+    def load_hyperparameters(self, filepath):
+        """Load hyperparameters from JSON file"""
+        with open(filepath, 'r') as f:
+            loaded_config = json.load(f)
+
+        self.config.update(loaded_config)
+        print(f"✅ Hyperparameters loaded from {filepath}")
+        return self.config
+
+    def predict_on_file(self, filepath, output_file=None, features_to_use=None, has_target=False, target_column=None):
+        """
+        Comprehensive prediction on file with feature selection
+        USES EXACT FEATURE NAMES AND ORDERING FROM TRAINING
+        """
+        try:
+            # Load data
+            df = pd.read_csv(filepath)
+            original_columns = df.columns.tolist()
+
+            print(f"📊 Prediction file columns: {original_columns}")
+            print(f"📊 Model feature names: {self.feature_names}")
+
+            # Determine features to use - ALWAYS USE MODEL'S FEATURE NAMES IN TRAINING ORDER
+            if features_to_use is None:
+                features_to_use = self.feature_names  # Use exact feature names from training
+
+            # Remove target column if specified
+            if target_column and target_column in features_to_use:
+                features_to_use = [f for f in features_to_use if f != target_column]
+
+            # STRICT FEATURE MATCHING: Use exact feature names and ordering from training
+            available_features = []
+            missing_features = []
+
+            for feature in features_to_use:
+                if feature in df.columns:
+                    available_features.append(feature)
+                else:
+                    missing_features.append(feature)
+
+            if missing_features:
+                print(f"❌ Missing features in prediction file: {missing_features}")
+                print(f"   Available features: {df.columns.tolist()}")
+                raise ValueError(f"Missing features in prediction file: {missing_features}")
+
+            if len(available_features) != len(features_to_use):
+                print(f"❌ Feature count mismatch. Expected: {len(features_to_use)}, Found: {len(available_features)}")
+                raise ValueError(f"Feature count mismatch. Expected: {len(features_to_use)}, Found: {len(available_features)}")
+
+            print(f"✅ All {len(available_features)} features matched by exact names")
+            print(f"🔧 Using features in training order: {available_features}")
+
+            # Extract features for prediction - IN EXACT TRAINING ORDER
+            prediction_features = df[available_features]
+
+            print(f"🔮 Making predictions using {len(available_features)} features")
+            print(f"   Features used (in training order): {available_features}")
+
+            # Make predictions
+            primary_predictions, probabilities, top_predictions, top_confidences = self.predict_with_confidence(prediction_features, top_n=3)
+
+            # Create results dataframe
+            results_df = df.copy()
+
+            # Add prediction columns
+            results_df['Prediction'] = primary_predictions
+            results_df['Confidence'] = [max(probs) for probs in probabilities]
+
+            # Add top 3 predictions with confidences
+            for i in range(3):
+                pred_col = f'Top_{i+1}_Prediction'
+                conf_col = f'Top_{i+1}_Confidence'
+
+                pred_values = []
+                conf_values = []
+
+                for j in range(len(top_predictions)):
+                    if i < len(top_predictions[j]):
+                        pred_values.append(top_predictions[j][i])
+                        conf_values.append(top_confidences[j][i])
+                    else:
+                        pred_values.append(None)
+                        conf_values.append(None)
+
+                results_df[pred_col] = pred_values
+                results_df[conf_col] = conf_values
+
+            # Sort by confidence (descending)
+            results_df = results_df.sort_values('Confidence', ascending=False)
+
+            # Save results
+            if output_file is None:
+                base_name = os.path.splitext(filepath)[0]
+                output_file = f"{base_name}_predictions.csv"
+
+            results_df.to_csv(output_file, index=False)
+            print(f"✅ Predictions saved to {output_file}")
+            print(f"📊 Results include: {len(available_features)} features, {len(results_df)} samples")
+            print(f"🎯 Confidence range: {results_df['Confidence'].min():.3f} - {results_df['Confidence'].max():.3f}")
+
+            return results_df
+
+        except Exception as e:
+            print(f"❌ Error during prediction: {e}")
+            print(f"🔍 Debug info:")
+            print(f"   File: {filepath}")
+            print(f"   Model features: {self.feature_names}")
+            if 'df' in locals():
+                print(f"   File columns: {df.columns.tolist()}")
+            raise
+
+
+def main():
+    """Main function with command-line interface - ENHANCED with freeze support and initLH"""
+    parser = argparse.ArgumentParser(
+        description="Enhanced CT-DBNN Classifier with Incremental Learning Support",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run with GUI
+  python ct_dbnn_enhanced.py --gui
+
+  # Train on Iris dataset with freeze enabled (default)
+  python ct_dbnn_enhanced.py --dataset iris --train
+
+  # Train with freeze disabled for incremental learning
+  python ct_dbnn_enhanced.py --dataset iris --train --unfreeze
+
+  # Compute likelihoods only without training
+  python ct_dbnn_enhanced.py --dataset iris --initLH
+
+  # Incremental training on new data (freeze must be disabled)
+  python ct_dbnn_enhanced.py --load-model model.pkl --incremental-train new_data.csv --target outcome
+
+  # Freeze likelihoods after training
+  python ct_dbnn_enhanced.py --load-model model.pkl --freeze
+
+  # Unfreeze likelihoods for updates
+  python ct_dbnn_enhanced.py --load-model model.pkl --unfreeze
+
+  # Check freeze status
+  python ct_dbnn_enhanced.py --load-model model.pkl --freeze-status
+        """
+    )
+
+    # Data options
+    data_group = parser.add_argument_group('Data Options')
+    data_group.add_argument('--dataset', help='UCI dataset to use (name from repository or custom)')
+    data_group.add_argument('--csv', help='Custom CSV file path')
+    data_group.add_argument('--features', help='Comma-separated list of features to use for training/prediction')
+    data_group.add_argument('--target', help='Target column name')
+
+    # Model options
+    model_group = parser.add_argument_group('Model Options')
+    model_group.add_argument('--resol', type=int, default=8,
+                           help='Resolution for feature discretization (default: 8)')
+    model_group.add_argument('--no-complex-tensor', action='store_true',
+                           help='Disable complex tensor operations')
+    model_group.add_argument('--no-orthogonal-weights', action='store_true',
+                           help='Disable orthogonal weight initialization')
+    model_group.add_argument('--smoothing-factor', type=float, default=1e-8,
+                           help='Smoothing factor for probabilities (default: 1e-8)')
+    model_group.add_argument('--no-parallel', action='store_true',
+                           help='Disable parallel processing')
+    model_group.add_argument('--n-jobs', type=int, default=-1,
+                           help='Number of parallel jobs (default: -1 for all)')
+
+    # FREEZE OPTIONS - NEW
+    freeze_group = parser.add_argument_group('Freeze Options')
+    freeze_group.add_argument('--freeze', action='store_true',
+                            help='Freeze likelihoods and weights (prevent updates)')
+    freeze_group.add_argument('--unfreeze', action='store_true',
+                            help='Unfreeze likelihoods and weights (allow incremental updates)')
+    freeze_group.add_argument('--freeze-status', action='store_true',
+                            help='Check current freeze status')
+
+    # Training options
+    training_group = parser.add_argument_group('Training Options')
+    training_group.add_argument('--train', action='store_true', help='Train model on dataset')
+    training_group.add_argument('--initLH', action='store_true',
+                               help='Compute likelihoods only without training (NEW)')
+    training_group.add_argument('--incremental-train', help='Perform incremental training on specified file')
+    training_group.add_argument('--no-split', action='store_true',
+                               help='Use all data for training (no test split)')
+    training_group.add_argument('--train-split', type=float, default=80,
+                               help='Percentage of data to use for training (default: 80)')
+    training_group.add_argument('--evaluate', action='store_true',
+                               help='Evaluate model on test set (requires train/test split)')
+
+    # Operation modes
+    operation_group = parser.add_argument_group('Operation Modes')
+    operation_group.add_argument('--gui', action='store_true',
+                               help='Launch GUI interface')
+    operation_group.add_argument('--load-model', help='Load model from file')
+    operation_group.add_argument('--save-model', help='Save model to file')
+    operation_group.add_argument('--save-hp', help='Save hyperparameters to JSON file')
+    operation_group.add_argument('--load-hp', help='Load hyperparameters from JSON file')
+
+    # Prediction options
+    pred_group = parser.add_argument_group('Prediction Options')
+    pred_group.add_argument('--predict', help='Run prediction on specified file')
+    pred_group.add_argument('--has-target', action='store_true',
+                          help='Input file has target column (will be ignored for prediction)')
+    pred_group.add_argument('--target-col', help='Target column name in prediction file')
+
+    # Additional options
+    parser.add_argument('--random-state', type=int, default=42,
+                       help='Random state for reproducibility (default: 42)')
+
+    args = parser.parse_args()
+
+    # FREEZE STATUS CHECK - NEW
+    if args.freeze_status:
+        if args.load_model:
+            model = ParallelCTDBNN()
+            model.load_model(args.load_model)
+            lh_status, wt_status = model.get_freeze_state()
+            print(f"🔒 Freeze status: LH={'FROZEN' if lh_status else 'UNFROZEN'}, WT={'FROZEN' if wt_status else 'UNFROZEN'}")
+            print(f"📊 Total training samples: {model.training_history.get('total_training_samples', 0)}")
+            print(f"📈 Incremental updates: {model.training_history.get('incremental_updates', 0)}")
+        else:
+            print("❌ Please specify --load-model to check freeze status")
+        return 0
+
+    # FREEZE/UNFREEZE COMMANDS - NEW
+    if args.freeze or args.unfreeze:
+        if not args.load_model:
+            print("❌ Please specify --load-model to modify freeze state")
+            return 1
+
+        model = ParallelCTDBNN()
+        model.load_model(args.load_model)
+
+        if args.freeze:
+            model.set_freeze_state(freeze_likelihoods=True, freeze_weights=True)
+            print("✅ Likelihoods and weights frozen")
+        else:
+            model.set_freeze_state(freeze_likelihoods=False, freeze_weights=False)
+            print("✅ Likelihoods and weights unfrozen")
+
+        if args.save_model:
+            model.save_model(args.save_model)
+
+        return 0
+
+    # INCREMENTAL TRAINING - NEW
+    if args.incremental_train:
+        if not args.load_model:
+            print("❌ Please specify --load-model for incremental training")
+            return 1
+
+        if not args.target:
+            print("❌ Please specify --target for incremental training")
+            return 1
+
+        model = ParallelCTDBNN()
+        model.load_model(args.load_model)
+
+        # Check freeze status
+        lh_status, wt_status = model.get_freeze_state()
+        if lh_status:
+            print("❌ Cannot perform incremental training: Likelihoods are FROZEN")
+            print("   Use --unfreeze first to enable incremental updates")
+            return 1
+
+        try:
+            # Load incremental data
+            df = pd.read_csv(args.incremental_train)
+
+            if args.features:
+                features_to_use = [f.strip() for f in args.features.split(',')]
+                missing_features = [f for f in features_to_use if f not in df.columns]
+                if missing_features:
+                    print(f"❌ Missing features: {missing_features}")
+                    return 1
+                features = df[features_to_use]
+            else:
+                features_to_use = [col for col in df.columns if col != args.target]
+                features = df[features_to_use]
+
+            targets = df[args.target]
+
+            print(f"🔄 Performing incremental training with {len(features)} new samples...")
+            model.incremental_train(features, targets, features_to_use)
+
+            # Re-train with orthogonal weights
+            model.train(features, targets, incremental=False)
+
+            if args.save_model:
+                model.save_model(args.save_model)
+                print(f"✅ Incrementally updated model saved to {args.save_model}")
+
+            return 0
+
+        except Exception as e:
+            print(f"❌ Incremental training failed: {e}")
+            return 1
+
+    # GUI mode
+    if args.gui:
+        app = EnhancedGUI()
+        app.run()
+        return 0
+
+    # Command-line mode - Prediction
+    if args.predict:
+        if not args.load_model:
+            print("❌ Please specify --load-model for prediction")
+            return 1
+
+        model = ParallelCTDBNN()
+        model.load_model(args.load_model)
+
+        features_to_use = None
+        if args.features:
+            features_to_use = [f.strip() for f in args.features.split(',')]
+
+        try:
+            results_df = model.predict_on_file(
+                filepath=args.predict,
+                features_to_use=features_to_use,
+                has_target=args.has_target,
+                target_column=args.target_col
+            )
+            print(f"✅ Prediction completed. Results saved to: {args.predict.replace('.csv', '_predictions.csv')}")
+            return 0
+        except Exception as e:
+            print(f"❌ Prediction failed: {e}")
+            return 1
+
+    # Command-line mode - Load existing model
+    if args.load_model:
+        model = ParallelCTDBNN()
+        model.load_model(args.load_model)
+
+        if args.evaluate:
+            if hasattr(model, 'X_test') and model.X_test is not None:
+                accuracy = model.evaluate(model.X_test, model.y_test)
+                print(f"Test accuracy: {accuracy:.3f}")
+            else:
+                print("❌ Cannot evaluate: No test data available in loaded model")
+
+        if args.save_model:
+            model.save_model(args.save_model)
+
+        return 0
+
+    # Training mode
+    if args.dataset or args.csv:
+        config = {
+            'resol': args.resol,
+            'use_complex_tensor': not args.no_complex_tensor,
+            'orthogonalize_weights': not args.no_orthogonal_weights,
+            'smoothing_factor': args.smoothing_factor,
+            'parallel_processing': not args.no_parallel,
+            'n_jobs': args.n_jobs,
+            'freeze_likelihoods': not args.unfreeze,  # NEW: Set freeze from command line
+            'freeze_weights': not args.unfreeze,      # NEW: Set weights freeze from command line
+        }
+
+        # Load data
+        if args.dataset:
+            print(f"Loading dataset: {args.dataset}")
+            if args.dataset == "iris":
+                data = load_iris()
+            elif args.dataset == "wine":
+                data = load_wine()
+            elif args.dataset == "breast_cancer":
+                data = load_breast_cancer()
+            elif args.dataset == "diabetes":
+                info = UCI_DATASETS["diabetes"]
+                df = UCIDatasetLoader.download_uci_data(info)
+                data = type('DiabetesData', (), {})()
+                data.data = df.iloc[:, :-1].values
+                data.target = df.iloc[:, -1].values
+            else:
+                info = UCIDatasetLoader.load_any_uci_dataset(args.dataset)
+                if info:
+                    df = UCIDatasetLoader.download_uci_data(info)
+                    if df is not None:
+                        data = type('CustomData', (), {})()
+                        data.data = df.iloc[:, :-1].values
+                        data.target = df.iloc[:, -1].values
+                    else:
+                        print(f"Could not download dataset: {args.dataset}")
+                        return 1
+                else:
+                    print(f"Dataset {args.dataset} not found")
+                    return 1
+
+            features = data.data
+            targets = data.target
+
+        elif args.csv:
+            if not args.target:
+                print("Please specify --target for CSV files")
+                return 1
+
+            print(f"Loading CSV: {args.csv}")
+            df = pd.read_csv(args.csv)
+
+            if args.features:
+                features_to_use = [f.strip() for f in args.features.split(',')]
+                missing_features = [f for f in features_to_use if f not in df.columns]
+                if missing_features:
+                    print(f"❌ Missing features: {missing_features}")
+                    return 1
+                features = df[features_to_use].values
+            else:
+                features_to_use = [col for col in df.columns if col != args.target]
+                features = df[features_to_use].values
+
+            targets = df[args.target].values
+            feature_names = features_to_use if args.features else [col for col in df.columns if col != args.target]
+
+        # Handle train/test split based on arguments
+        if args.no_split:
+            X_train = features
+            y_train = targets
+            X_test = None
+            y_test = None
+            print("✅ Using 100% of data for training (no test split)")
+            print(f"   Training samples: {len(X_train)}")
+        else:
+            test_size = (100 - args.train_split) / 100.0
+            X_train, X_test, y_train, y_test = train_test_split(
+                features, targets,
+                test_size=test_size,
+                random_state=args.random_state,
+                stratify=targets
+            )
+            print(f"✅ Data split: {args.train_split}% training, {100-args.train_split}% testing")
+            print(f"   Training samples: {len(X_train)}")
+            print(f"   Testing samples: {len(X_test)}")
+
+        # Initialize and train model
+        model = ParallelCTDBNN(config)
+
+        if 'feature_names' in locals():
+            model.feature_names = feature_names
+            model.selected_features = feature_names
+            model.target_column_name = args.target
+
+        # NEW: Compute likelihoods only option
+        if args.initLH:
+            print("🔧 Computing likelihoods only (no training)...")
+            model.compute_likelihoods_only(X_train, y_train, feature_names if 'feature_names' in locals() else None)
+
+            if args.save_model:
+                model.save_model(args.save_model)
+                print(f"✅ Model with likelihoods saved to {args.save_model}")
+
+            return 0
+
+        print("Computing global likelihoods...")
+        model.compute_global_likelihoods(X_train, y_train, feature_names if 'feature_names' in locals() else None)
+
+        if args.train:
+            print("Training model...")
+            model.train(X_train, y_train)
+
+            if args.evaluate:
+                if X_test is not None and y_test is not None:
+                    accuracy = model.evaluate(X_test, y_test)
+                    print(f"Test accuracy: {accuracy:.3f}")
+                else:
+                    print("❌ Cannot evaluate: No test data available (use --train-split instead of --no-split)")
+
+        if args.save_model:
+            model.save_model(args.save_model)
+
+        if args.save_hp:
+            model.save_hyperparameters(args.save_hp)
+
+    elif args.load_hp:
+        model = ParallelCTDBNN()
+        model.load_hyperparameters(args.load_hp)
+        print(f"Loaded hyperparameters: {model.config}")
+
+    else:
+        parser.print_help()
+
+    return 0
+
+
+if __name__ == "__main__":
+    # Add ASCII art and welcome message
+    print("""
+    ╔═════════════════════════════════════════════════════════════╗
+    ║              🧠    CT-DBNN CLASSIFIER                       ║
+    ║ Complex Tensor Difference Boosting Bayesian Neural Network  ║
+    ║                 author: nsp@airis4d.com                     ║
+    ║  Artificial Intelligence Research and Intelligent Systems   ║
+    ║                 Thelliyoor 689544, India                    ║
+    ║         Complex Tensor + Parallel + Orthogonisation         ║
+    ║          INCREMENTAL LEARNING + FREEZE MECHANISM            ║
+    ║                 implementation: deepseek                    ║
+    ╚═════════════════════════════════════════════════════════════╝
+    """)
+
+    main()
 
 if __name__ == "__main__":
     # Add ASCII art and welcome message
